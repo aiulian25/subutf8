@@ -4,56 +4,64 @@ use std::sync::Arc;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path as RoutePath, Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use subutf8_core::batch::Origin;
+use subutf8_core::decoding::Reading;
+use subutf8_core::detection;
 use subutf8_core::encoding_catalog::{find_manual_choice, manual_choices};
 use subutf8_core::input_scan::{AllowedArea, SkipReason};
-use subutf8_core::language::SubtitleLanguage;
+use subutf8_core::language::{SubtitleLanguage, hinted_languages};
 use subutf8_core::output_naming::{dropped_file_name, split_srt_name};
+use subutf8_core::report::Outcome;
 
 use crate::constants::{
-    MAXIMUM_QUERY_CHARACTERS, MAXIMUM_WATCH_FOLDERS, MINIMUM_MANUAL_CHECK_INTERVAL,
+    ATTACHMENT_DISPOSITION_PREFIX, MAXIMUM_QUERY_CHARACTERS, MAXIMUM_WATCH_FOLDERS,
+    MINIMUM_MANUAL_CHECK_INTERVAL, SUBRIP_CONTENT_TYPE, UNRESERVED_NAME_PUNCTUATION,
 };
 use crate::defaults::Defaults;
 use crate::folders::list_folder;
 use crate::history::HistoryRecord;
 use crate::instance;
+use crate::json_path::JsonPath;
 use crate::server::{AppState, lock};
 use crate::session::{
-    SessionProblem, SessionSettings, detect_again, gather, origin_bytes, prepare, preview_file,
+    FilePreview, SessionProblem, SessionSettings, detect_again, gather, origin_bytes, prepare,
+    preview_file, read_file,
 };
 use crate::settings::Mode;
 use crate::update::{self, Step, UpdateProblem};
 use crate::views::{
-    AddedView, DestinationName, HistoryEntryView, ListingView, PreviewView, Problem, Reason,
-    SettingsView, StateExtras, StateView, UpdateView, WatchLogView, added_view, data_problem,
-    gathered_view, history_view, listing_view, manual_choice_problem, preview_view,
-    read_problem_description, skip_reason_problem, state_view, store_problem, update_view,
-    watch_log_view,
+    AddedView, CandidatesView, DestinationName, HistoryEntryView, LanguagesView, ListingView,
+    PreviewView, Problem, Reason, StateExtras, StateView, UpdateView, WatchLogView, added_view,
+    candidates_view, data_problem, gathered_view, history_view, listing_view,
+    manual_choice_problem, preview_view, read_problem_description, skip_reason_problem, state_view,
+    store_problem, update_view, watch_log_view,
 };
 
-/// An error answer: the HTTP status and the reason the interface shows.
+/// An error answer: the HTTP status and the reason the interface shows. The problem is boxed so
+/// every `Result` that may carry it stays small.
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
-    problem: Problem,
+    problem: Box<Problem>,
 }
 
 impl ApiError {
-    fn new(status: StatusCode, reason: Reason) -> Self {
+    fn with_problem(status: StatusCode, problem: Problem) -> Self {
         Self {
             status,
-            problem: Problem::of(reason),
+            problem: Box::new(problem),
         }
     }
 
+    fn new(status: StatusCode, reason: Reason) -> Self {
+        Self::with_problem(status, Problem::of(reason))
+    }
+
     fn refused(reason: SkipReason) -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            problem: skip_reason_problem(reason),
-        }
+        Self::with_problem(StatusCode::FORBIDDEN, skip_reason_problem(reason))
     }
 }
 
@@ -74,10 +82,10 @@ impl From<SessionProblem> for ApiError {
                 Self::new(StatusCode::PAYLOAD_TOO_LARGE, Reason::TooMuchDropped)
             }
             SessionProblem::ListFull => Self::new(StatusCode::CONFLICT, Reason::ListFull),
-            SessionProblem::ManualChoice(refusal) => Self {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                problem: manual_choice_problem(refusal),
-            },
+            SessionProblem::ManualChoice(refusal) => Self::with_problem(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                manual_choice_problem(refusal),
+            ),
         }
     }
 }
@@ -126,6 +134,13 @@ pub async fn encodings() -> Json<Vec<&'static str>> {
     )
 }
 
+/// UI-19.
+pub async fn languages() -> Json<LanguagesView> {
+    Json(LanguagesView {
+        hinted: hinted_languages(),
+    })
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowseRequest {
@@ -150,7 +165,7 @@ pub async fn browse(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AddRequest {
-    paths: Vec<PathBuf>,
+    paths: Vec<JsonPath>,
     #[serde(default)]
     include_subfolders: bool,
 }
@@ -159,8 +174,18 @@ pub async fn add(
     State(app): State<AppState>,
     Json(request): Json<AddRequest>,
 ) -> Result<Json<AddedView>, ApiError> {
-    let added = add_paths(&app, request.paths, request.include_subfolders).await?;
+    let paths = requested_paths(request.paths)?;
+    let added = add_paths(&app, paths, request.include_subfolders).await?;
     Ok(Json(added))
+}
+
+/// NAME-11: names in any encoding; a path whose hexadecimal does not read is refused whole.
+fn requested_paths(paths: Vec<JsonPath>) -> Result<Vec<PathBuf>, ApiError> {
+    paths
+        .into_iter()
+        .map(JsonPath::into_path)
+        .collect::<Option<_>>()
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, Reason::InvalidPath))
 }
 
 /// Reads and classifies outside the session lock, so the interface stays responsive.
@@ -184,7 +209,7 @@ pub async fn add_paths(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenRequest {
-    paths: Vec<PathBuf>,
+    paths: Vec<JsonPath>,
 }
 
 /// ACCESS-08: a second launch hands its files over and asks for the interface to show.
@@ -195,7 +220,8 @@ pub async fn open(
     let Some(interface) = app.interface.clone() else {
         return Err(ApiError::new(StatusCode::FORBIDDEN, Reason::NotAvailable));
     };
-    let added = add_paths(&app, request.paths, false).await?;
+    let paths = requested_paths(request.paths)?;
+    let added = add_paths(&app, paths, false).await?;
     interface.show();
     Ok(Json(added))
 }
@@ -235,30 +261,76 @@ pub async fn upload(
     Ok(Json(added_view(added, Vec::new(), false)))
 }
 
-/// UI-04.
+/// UI-04, ENC-22 for a garbled file, and ENC-23 with the file's language.
 pub async fn preview(
     State(app): State<AppState>,
     RoutePath(id): RoutePath<u64>,
 ) -> Result<Json<PreviewView>, ApiError> {
-    let (origin, encoding) = {
+    let (origin, reading, misreading, language, comma_letters) = {
         let session = app.session();
         let file = session.find(id)?;
-        (file.origin.clone(), file.current_encoding())
+        let language = file.effective_language(session.settings.language.as_ref());
+        (
+            file.origin.clone(),
+            file.current_reading(),
+            file.misreading,
+            language.cloned(),
+            session.settings.romanian_comma_letters,
+        )
     };
-    let Some(encoding) = encoding else {
-        return Ok(Json(preview_view(None, Ok(Vec::new()))));
+    let Some(reading) = reading else {
+        let nothing = FilePreview {
+            cues: Ok(Vec::new()),
+            repair_sample: None,
+        };
+        return Ok(Json(preview_view(None, nothing)));
     };
-    let preview = blocking(move || preview_file(&origin, encoding)).await?;
-    Ok(Json(preview_view(Some(encoding), preview)))
+    let preview = blocking(move || {
+        preview_file(
+            &origin,
+            reading,
+            misreading,
+            language.as_ref(),
+            comma_letters,
+        )
+    })
+    .await?;
+    Ok(Json(preview_view(Some(reading.encoding()), preview)))
+}
+
+/// UI-15: encodings to suggest, each with a sample line; none for a file that cannot be read.
+pub async fn candidates(
+    State(app): State<AppState>,
+    RoutePath(id): RoutePath<u64>,
+) -> Result<Json<CandidatesView>, ApiError> {
+    let (origin, classification, language) = {
+        let session = app.session();
+        let file = session.find(id)?;
+        let language = session.settings.language.clone();
+        (file.origin.clone(), file.classification, language)
+    };
+    let Ok(classification) = classification else {
+        return Ok(Json(CandidatesView::default()));
+    };
+    let found = blocking(move || {
+        origin_bytes(&origin)
+            .map(|bytes| detection::candidates(&bytes, classification, language.as_ref()))
+            .unwrap_or_default()
+    })
+    .await?;
+    Ok(Json(candidates_view(found)))
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EncodingRequest {
     encoding: String,
+    /// ENC-21: a damaged or mixed file keeps its lines that are UTF-8.
+    #[serde(default)]
+    keep_utf8_lines: bool,
 }
 
-/// ENC-12: only the exact name of an offered encoding is accepted.
+/// ENC-12 and ENC-21: only the exact name of an offered encoding is accepted.
 pub async fn choose_encoding(
     State(app): State<AppState>,
     RoutePath(id): RoutePath<u64>,
@@ -271,12 +343,78 @@ pub async fn choose_encoding(
         .await?
         .map_err(|problem| {
             let (_, problem) = read_problem_description(problem);
-            ApiError {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                problem,
-            }
+            ApiError::with_problem(StatusCode::UNPROCESSABLE_ENTITY, problem)
         })?;
-    app.session().choose_encoding(id, encoding, &bytes)?;
+    let reading = if request.keep_utf8_lines {
+        Reading::Utf8LinesElse(encoding)
+    } else {
+        Reading::Whole(encoding)
+    };
+    app.session().choose_reading(id, reading, &bytes)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// UI-17: a converted file as it was written, for a browser to save. Only the output recorded for
+/// a listed file is sent, read as sources are, and only from inside the allowed area (SAFE-13).
+pub async fn output(
+    State(app): State<AppState>,
+    RoutePath(id): RoutePath<u64>,
+) -> Result<Response, ApiError> {
+    let output = match &app.session().find(id)?.outcome {
+        Some(Outcome::Converted { output, .. }) => output.clone(),
+        _ => return Err(ApiError::new(StatusCode::CONFLICT, Reason::NotConverted)),
+    };
+    let name = output
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let area = app.settings.allowed_area.clone();
+    let bytes = blocking(move || {
+        let real = area.real_location(&output).map_err(ApiError::refused)?;
+        read_file(&real).map_err(|problem| {
+            let (_, problem) = read_problem_description(problem);
+            ApiError::with_problem(StatusCode::UNPROCESSABLE_ENTITY, problem)
+        })
+    })
+    .await??;
+    let headers = [
+        (header::CONTENT_TYPE, SUBRIP_CONTENT_TYPE.to_owned()),
+        (
+            header::CONTENT_DISPOSITION,
+            [ATTACHMENT_DISPOSITION_PREFIX, &percent_encoded(&name)].concat(),
+        ),
+    ];
+    Ok((headers, bytes).into_response())
+}
+
+/// RFC 8187: letters, digits and a little punctuation stay as they are, and every other byte of
+/// the name becomes `%XX`, so no name can break the header.
+fn percent_encoded(name: &str) -> String {
+    name.bytes()
+        .map(|byte| {
+            let is_unreserved =
+                byte.is_ascii_alphanumeric() || UNRESERVED_NAME_PUNCTUATION.contains(&byte);
+            if is_unreserved {
+                return char::from(byte).to_string();
+            }
+            format!("%{byte:02X}")
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepairRequest {
+    repair: bool,
+}
+
+/// ENC-22: Repair, or Keep as it is.
+pub async fn repair(
+    State(app): State<AppState>,
+    RoutePath(id): RoutePath<u64>,
+    Json(request): Json<RepairRequest>,
+) -> Result<StatusCode, ApiError> {
+    app.session().choose_repair(id, request.repair)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -291,34 +429,6 @@ pub async fn remove(
 
 pub async fn clear(State(app): State<AppState>) -> Result<StatusCode, ApiError> {
     app.session().clear()?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// UI-05, NAME-05 and SAFE-13: the language tag is validated before any file is touched,
-/// and a new output folder must lie inside the allowed area.
-pub async fn change_settings(
-    State(app): State<AppState>,
-    Json(request): Json<SettingsView>,
-) -> Result<StatusCode, ApiError> {
-    let language = parsed_language(request.language.as_deref())?;
-    let current_folder = app.session().settings.output_folder.clone();
-    let requested_folder = PathBuf::from(&request.output_folder);
-    let output_folder = if requested_folder == current_folder {
-        current_folder
-    } else {
-        let area = app.settings.allowed_area.clone();
-        blocking(move || real_folder(&area, &requested_folder))
-            .await?
-            .map_err(ApiError::refused)?
-    };
-    let settings = SessionSettings {
-        language,
-        destination: request.destination.into(),
-        output_folder,
-        organise_by_day: request.organise_by_day,
-        collision_policy: request.collision_policy.into(),
-    };
-    apply_session_settings(&app, settings).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -341,20 +451,56 @@ fn real_folder(area: &AllowedArea, folder: &Path) -> Result<PathBuf, SkipReason>
     Ok(real)
 }
 
-/// UI-05 and ENC-13: detection runs again when the language changes.
+/// SET-01 and ENC-13: the list takes the saved settings at once, and detection runs again when
+/// the language changes.
 async fn apply_session_settings(app: &AppState, settings: SessionSettings) -> Result<(), ApiError> {
-    let language = settings.language.clone();
     let language_changed = app.session().update_settings(settings)?;
     if !language_changed {
         return Ok(());
     }
     let files = app.session().detection_dependent();
-    let detections = blocking(move || detect_again(files, language.as_ref())).await?;
+    detect_files_again(app, files).await
+}
+
+/// ENC-13: detects files again off the server's threads, each with the language it goes by.
+async fn detect_files_again(
+    app: &AppState,
+    files: Vec<(u64, Origin, Option<SubtitleLanguage>)>,
+) -> Result<(), ApiError> {
+    let redetections = blocking(move || detect_again(files)).await?;
     let mut session = app.session();
-    for (id, detection) in detections {
-        session.set_detection(id, detection);
+    for redetection in redetections {
+        session.set_detection(redetection);
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileLanguageRequest {
+    language: Option<String>,
+}
+
+/// UI-16: a file's own subtitle language, or none to follow the saved one again. The file is
+/// detected again with it (ENC-13); NAME-05 checks the tag first.
+pub async fn set_file_language(
+    State(app): State<AppState>,
+    RoutePath(id): RoutePath<u64>,
+    Json(request): Json<FileLanguageRequest>,
+) -> Result<StatusCode, ApiError> {
+    let language = parsed_language(request.language.as_deref())?;
+    let to_detect = {
+        let mut session = app.session();
+        let changed = session.set_file_language(id, language)?;
+        let file = session.find(id)?;
+        let language = file.effective_language(session.settings.language.as_ref());
+        let needs_detection = changed && file.depends_on_language();
+        needs_detection.then(|| vec![(id, file.origin.clone(), language.cloned())])
+    };
+    if let Some(files) = to_detect {
+        detect_files_again(&app, files).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// SET-01 and SET-04: every value is checked before anything is saved, and the current
@@ -369,9 +515,8 @@ pub async fn save_defaults(
     let store = app.clone();
     blocking(move || store.defaults().save(defaults))
         .await?
-        .map_err(|problem| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            problem: store_problem(problem),
+        .map_err(|problem| {
+            ApiError::with_problem(StatusCode::INTERNAL_SERVER_ERROR, store_problem(problem))
         })?;
     apply_session_settings(&app, session_settings).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -386,9 +531,8 @@ pub async fn restore_defaults(State(app): State<AppState>) -> Result<StatusCode,
         store.restore().map(|()| store.current.session_settings())
     })
     .await?
-    .map_err(|problem| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        problem: store_problem(problem),
+    .map_err(|problem| {
+        ApiError::with_problem(StatusCode::INTERNAL_SERVER_ERROR, store_problem(problem))
     })?;
     apply_session_settings(&app, session_settings).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -427,10 +571,10 @@ async fn checked_defaults(app: &AppState, defaults: Defaults) -> Result<Defaults
         for folder in &defaults.watch_folders {
             let real = real_folder(&area, folder).map_err(ApiError::refused)?;
             if writes_to_output_folder && output_folder.starts_with(&real) {
-                return Err(ApiError {
-                    status: StatusCode::UNPROCESSABLE_ENTITY,
-                    problem: Problem::about(Reason::WatchFolderHoldsOutputFolder, &text(&real)),
-                });
+                return Err(ApiError::with_problem(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Problem::about(Reason::WatchFolderHoldsOutputFolder, &text(&real)),
+                ));
             }
             if !watch_folders.contains(&real) {
                 watch_folders.push(real);
@@ -616,12 +760,7 @@ pub async fn convert(State(app): State<AppState>) -> Result<StatusCode, ApiError
         let mut records = Vec::new();
         conversion.run(|finished, job, outcome| {
             lock(&worker.session).record_outcome(finished, outcome);
-            records.extend(HistoryRecord::of(
-                job,
-                outcome,
-                conversion.language(),
-                false,
-            ));
+            records.extend(HistoryRecord::of(job, outcome, false));
         });
         worker.history().append(records);
     });
@@ -653,9 +792,10 @@ pub async fn quit(State(app): State<AppState>) -> Result<StatusCode, ApiError> {
 mod tests {
     use super::*;
     use crate::constants::{
-        ADD_ROUTE, BROWSE_ROUTE, CONVERT_ROUTE, DEFAULTS_ROUTE, HISTORY_ROUTE,
-        MAXIMUM_UPLOAD_BYTES, RESTORE_DEFAULTS_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, UPLOAD_ROUTE,
+        ADD_ROUTE, BROWSE_ROUTE, CLEAR_ROUTE, CONVERT_ROUTE, DEFAULTS_ROUTE, HISTORY_ROUTE,
+        LANGUAGES_ROUTE, MAXIMUM_UPLOAD_BYTES, RESTORE_DEFAULTS_ROUTE, STATE_ROUTE, UPLOAD_ROUTE,
     };
+    use crate::json_path::encode_hex;
     use crate::test_support::{
         api_request, call, fixture_output, fixture_source, parity_set, route, send, test_app,
         wait_for_conversion,
@@ -663,8 +803,11 @@ mod tests {
     use axum::body::Body;
     use axum::http::Method;
     use serde_json::{Value, json};
+    use std::ffi::OsStr;
     use std::fs;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
+    use subutf8_core::language::with_romanian_comma_letters;
 
     async fn post(app: &axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
         call(app, Method::POST, &route(path), Some(body)).await
@@ -895,6 +1038,7 @@ mod tests {
         defaults["watchFolders"] = json!([watched]);
         defaults["theme"] = json!("dark");
         defaults["language"] = json!("RO");
+        defaults["organiseByDay"] = json!(true);
         let (status, _) = post(&app, DEFAULTS_ROUTE, defaults).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (_, state) = call(&app, Method::GET, &route(STATE_ROUTE), None).await;
@@ -903,9 +1047,22 @@ mod tests {
             state["defaults"]["watchFolders"],
             json!([fs::canonicalize(&watched).unwrap()])
         );
-        assert_eq!(state["settings"]["destination"], "output-folder");
-        assert_eq!(state["settings"]["language"], "ro");
         assert!(served_page(&app).await.contains("data-theme=\"dark\""));
+        // The next conversion uses the saved settings: the language tag, and the day's folder
+        // in the output folder.
+        let original = data.path().join("Film.srt");
+        fs::copy(fixture_source("windows-1250-romanian"), &original).unwrap();
+        post(&app, ADD_ROUTE, json!({ "paths": [original] })).await;
+        call(&app, Method::POST, &route(CONVERT_ROUTE), None).await;
+        wait_for_conversion(&app).await;
+        let output_folder = fs::canonicalize(data.path()).unwrap();
+        let written = output_folder
+            .join(crate::clock::today().name())
+            .join("Film.ro.srt");
+        assert_eq!(
+            fs::read_to_string(written).unwrap(),
+            fixture_output("windows-1250-romanian")
+        );
         let (status, _) = call(&app, Method::POST, &route(RESTORE_DEFAULTS_ROUTE), None).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (_, state) = call(&app, Method::GET, &route(STATE_ROUTE), None).await;
@@ -939,38 +1096,329 @@ mod tests {
         assert_eq!(found, json!([]));
     }
 
-    /// NAME-05 and SAFE-13.
+    async fn first_file_id(app: &axum::Router) -> Value {
+        let (_, state) = call(app, Method::GET, &route(STATE_ROUTE), None).await;
+        state["files"][0]["id"].clone()
+    }
+
+    /// ENC-12: a refused encoding names the line where it stops fitting.
     #[tokio::test]
-    async fn settings_are_validated() {
-        let data = tempfile::tempdir().unwrap();
-        let app = test_app(data.path(), data.path());
-        let (_, state) = call(&app, Method::GET, &route(STATE_ROUTE), None).await;
-        let mut settings = state["settings"].clone();
-        settings["language"] = json!("../x");
+    async fn refused_choice_reports_its_line() {
+        let folder = tempfile::tempdir().unwrap();
+        let app = test_app(folder.path(), folder.path());
+        upload_bytes(
+            &app,
+            "markup.srt",
+            fs::read(fixture_source("markup")).unwrap(),
+        )
+        .await;
+        let id = first_file_id(&app).await;
         let (status, body) = call(
             &app,
             Method::POST,
-            &route(SETTINGS_ROUTE),
-            Some(settings.clone()),
+            &file_route(&id, "encoding"),
+            Some(json!({ "encoding": "ISO-8859-2" })),
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(body["reason"], "invalid-language");
-        settings["language"] = json!("ro");
-        settings["outputFolder"] = json!("/etc");
-        let (status, body) = call(
+        assert_eq!(body["reason"], "does-not-decode");
+        assert_eq!(body["line"], 3);
+    }
+
+    /// UI-14: UTF-32 starts like UTF-16, so its preview stops on its first line.
+    #[tokio::test]
+    async fn failed_preview_shows_the_broken_line() {
+        let folder = tempfile::tempdir().unwrap();
+        let app = test_app(folder.path(), folder.path());
+        let utf32_little_endian = vec![0xFF, 0xFE, 0x00, 0x00, b'H', 0x00, 0x00, 0x00];
+        upload_bytes(&app, "wide.srt", utf32_little_endian).await;
+        let id = first_file_id(&app).await;
+        let (_, preview) = call(&app, Method::GET, &file_route(&id, "preview"), None).await;
+        assert_eq!(preview["problem"]["reason"], "damaged-utf16");
+        assert_eq!(preview["problem"]["line"], 1);
+        assert_eq!(
+            preview["brokenLine"],
+            json!({ "line": 1, "text": "\u{FFFD}H\u{FFFD}" })
+        );
+    }
+
+    /// UI-15: "Bună!" has one accented letter, too little to detect, so it needs review.
+    #[tokio::test]
+    async fn candidates_are_offered_for_a_short_file() {
+        let folder = tempfile::tempdir().unwrap();
+        let app = test_app(folder.path(), folder.path());
+        let bytes = fs::read(fixture_source("short-romanian")).unwrap();
+        upload_bytes(&app, "short.srt", bytes).await;
+        let id = first_file_id(&app).await;
+        let (status, body) = call(&app, Method::GET, &file_route(&id, "candidates"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let found = body["candidates"].as_array().unwrap();
+        assert!(found.iter().any(|candidate| candidate["sample"] == "Bună!"));
+
+        let (status, _) = call(
             &app,
-            Method::POST,
-            &route(SETTINGS_ROUTE),
-            Some(settings.clone()),
+            Method::GET,
+            &file_route(&json!(0), "candidates"),
+            None,
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body["reason"], "outside-allowed-area");
-        settings["outputFolder"] = state["settings"]["outputFolder"].clone();
-        let (status, _) = call(&app, Method::POST, &route(SETTINGS_ROUTE), Some(settings)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    async fn set_language(app: &axum::Router, id: &Value, language: &str) -> (StatusCode, Value) {
+        let body = json!({ "language": language });
+        call(app, Method::POST, &file_route(id, "language"), Some(body)).await
+    }
+
+    /// UI-16 and ENC-13: a file's own language replaces the saved one, for its detection and
+    /// for its output name.
+    #[tokio::test]
+    async fn a_file_language_overrides_the_list() {
+        let folder = tempfile::tempdir().unwrap();
+        let app = test_app(folder.path(), folder.path());
+        let bytes = fs::read(fixture_source("windows-1252-french")).unwrap();
+        upload_bytes(&app, "french.srt", bytes).await;
+        let (_, state) = call(&app, Method::GET, &route(STATE_ROUTE), None).await;
+        let mut defaults = state["defaults"].clone();
+        defaults["language"] = json!("ro");
+        let (status, _) = post(&app, DEFAULTS_ROUTE, defaults).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (_, state) = call(&app, Method::GET, &route(STATE_ROUTE), None).await;
-        assert_eq!(state["settings"]["language"], "ro");
+        let id = state["files"][0]["id"].clone();
+        assert_eq!(state["files"][0]["status"], "needs-review");
+        assert_eq!(
+            state["files"][0]["problem"]["reason"],
+            "language-hint-disagrees"
+        );
+
+        let (status, body) = set_language(&app, &id, "../x").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["reason"], "invalid-language");
+        let (status, _) = set_language(&app, &id, "FR").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, state) = call(&app, Method::GET, &route(STATE_ROUTE), None).await;
+        assert_eq!(state["files"][0]["status"], "ready");
+        assert_eq!(state["files"][0]["language"], "fr");
+
+        call(&app, Method::POST, &route(CONVERT_ROUTE), None).await;
+        let state = wait_for_conversion(&app).await;
+        let output = state["files"][0]["output"].as_str().unwrap();
+        assert!(output.ends_with("french.fr.srt"), "{output}");
+    }
+
+    /// ENC-21: a mixed file converts only with its UTF-8 lines kept, and then exactly.
+    #[tokio::test]
+    async fn mixed_file_converts_with_its_utf8_lines() {
+        let folder = tempfile::tempdir().unwrap();
+        let app = test_app(folder.path(), folder.path());
+        let bytes = fs::read(fixture_source("mixed-utf8-1250")).unwrap();
+        upload_bytes(&app, "mixed.srt", bytes).await;
+        let id = first_file_id(&app).await;
+        let (_, state) = call(&app, Method::GET, &route(STATE_ROUTE), None).await;
+        assert_eq!(state["files"][0]["canKeepUtf8Lines"], true);
+        assert_eq!(state["files"][0]["keepsUtf8Lines"], true);
+
+        let whole = json!({ "encoding": "windows-1250" });
+        let (status, body) = post_to(&app, &file_route(&id, "encoding"), whole).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["reason"], "does-not-decode");
+        let kept = json!({ "encoding": "windows-1250", "keepUtf8Lines": true });
+        let (status, _) = post_to(&app, &file_route(&id, "encoding"), kept).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, state) = call(&app, Method::GET, &route(STATE_ROUTE), None).await;
+        assert_eq!(state["files"][0]["status"], "ready");
+        assert_eq!(state["files"][0]["encoding"], "windows-1250");
+        assert_eq!(state["files"][0]["reading"], "UTF-8 + windows-1250");
+
+        call(&app, Method::POST, &route(CONVERT_ROUTE), None).await;
+        wait_for_conversion(&app).await;
+        let written = fs::read_to_string(folder.path().join("mixed.srt")).unwrap();
+        assert_eq!(written, fixture_output("mixed-utf8-1250"));
+        assert!(!written.contains("BunÄƒ"));
+    }
+
+    /// ENC-22: a garbled file waits until it is repaired or kept as it is.
+    #[tokio::test]
+    async fn garbled_file_waits_until_repaired_or_kept() {
+        let folder = tempfile::tempdir().unwrap();
+        let app = test_app(folder.path(), folder.path());
+        let bytes = fs::read(fixture_source("garbled-romanian")).unwrap();
+        upload_bytes(&app, "garbled.srt", bytes).await;
+        let id = first_file_id(&app).await;
+        let (_, state) = call(&app, Method::GET, &route(STATE_ROUTE), None).await;
+        let file = &state["files"][0];
+        assert_eq!(file["status"], "needs-review");
+        assert_eq!(file["problem"]["reason"], "looks-garbled");
+        assert_eq!(file["problem"]["encoding"], "windows-1250");
+        assert_eq!(file["problem"]["misreadAs"], "windows-1252");
+        assert_eq!(file["canRepair"], true);
+        let (_, preview) = call(&app, Method::GET, &file_route(&id, "preview"), None).await;
+        assert_eq!(
+            preview["repair"]["asIs"],
+            "Bunã dimineaþa! ªtii ce înseamnã asta?"
+        );
+        assert_eq!(
+            preview["repair"]["repaired"],
+            "Bună dimineaţa! Ştii ce înseamnă asta?"
+        );
+
+        let repair = json!({ "repair": true });
+        let (status, _) = post_to(&app, &file_route(&id, "repair"), repair).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, state) = call(&app, Method::GET, &route(STATE_ROUTE), None).await;
+        assert_eq!(state["files"][0]["status"], "ready");
+        assert_eq!(state["files"][0]["reading"], "windows-1250 (repaired)");
+        assert_eq!(state["files"][0]["isRepaired"], true);
+
+        call(&app, Method::POST, &route(CONVERT_ROUTE), None).await;
+        wait_for_conversion(&app).await;
+        let written = fs::read_to_string(folder.path().join("garbled.srt")).unwrap();
+        assert_eq!(written, fixture_output("windows-1250-romanian"));
+    }
+
+    /// ENC-22: UTF-8 with a control character and no repair says so, with its line.
+    #[tokio::test]
+    async fn utf8_with_control_characters_names_its_line() {
+        let folder = tempfile::tempdir().unwrap();
+        let app = test_app(folder.path(), folder.path());
+        let text = "1\n00:00:01,000 --> 00:00:02,000\nBună \u{81}ziua\n";
+        upload_bytes(&app, "control.srt", text.as_bytes().to_vec()).await;
+        call(&app, Method::POST, &route(CONVERT_ROUTE), None).await;
+        let state = wait_for_conversion(&app).await;
+        let file = &state["files"][0];
+        assert_eq!(file["status"], "failed");
+        assert_eq!(file["problem"]["reason"], "control-characters-in-utf8");
+        assert_eq!(file["problem"]["line"], 3);
+    }
+
+    /// ENC-23: with Romanian and the comma letters saved, the preview and the output use ș ț.
+    #[tokio::test]
+    async fn romanian_comma_letters_show_in_the_preview_and_the_output() {
+        let folder = tempfile::tempdir().unwrap();
+        let app = test_app(folder.path(), folder.path());
+        let (_, state) = call(&app, Method::GET, &route(STATE_ROUTE), None).await;
+        let mut defaults = state["defaults"].clone();
+        assert_eq!(defaults["romanianCommaLetters"], false);
+        defaults["language"] = json!("ro");
+        defaults["romanianCommaLetters"] = json!(true);
+        let (status, _) = post(&app, DEFAULTS_ROUTE, defaults).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let bytes = fs::read(fixture_source("windows-1250-romanian")).unwrap();
+        upload_bytes(&app, "Film.srt", bytes).await;
+        let id = first_file_id(&app).await;
+        let (_, preview) = call(&app, Method::GET, &file_route(&id, "preview"), None).await;
+        assert_eq!(
+            preview["cues"][0]["text"],
+            "Bună dimineața! Știi ce înseamnă asta?"
+        );
+
+        call(&app, Method::POST, &route(CONVERT_ROUTE), None).await;
+        wait_for_conversion(&app).await;
+        let written = fs::read_to_string(folder.path().join("Film.ro.srt")).unwrap();
+        let output = fixture_output("windows-1250-romanian");
+        assert_eq!(written, with_romanian_comma_letters(&output));
+    }
+
+    /// UI-17: a converted file comes back as it was written, named as RFC 8187 allows.
+    #[tokio::test]
+    async fn converted_output_can_be_downloaded() {
+        let folder = tempfile::tempdir().unwrap();
+        let app = test_app(folder.path(), folder.path());
+        let bytes = fs::read(fixture_source("windows-1250-romanian")).unwrap();
+        upload_bytes(&app, "Bună ziua.srt", bytes).await;
+        let id = first_file_id(&app).await;
+        call(&app, Method::POST, &route(CONVERT_ROUTE), None).await;
+        wait_for_conversion(&app).await;
+        let request = api_request(Method::GET, &file_route(&id, "output"), Body::empty());
+        let (status, headers, body) = send(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, fixture_output("windows-1250-romanian").as_bytes());
+        assert_eq!(headers[header::CONTENT_TYPE], SUBRIP_CONTENT_TYPE);
+        assert_eq!(
+            headers[header::CONTENT_DISPOSITION],
+            "attachment; filename*=UTF-8''Bun%C4%83%20ziua.srt"
+        );
+    }
+
+    /// UI-17: only a converted file in the list can be downloaded.
+    #[tokio::test]
+    async fn unconverted_output_is_refused() {
+        let folder = tempfile::tempdir().unwrap();
+        let app = test_app(folder.path(), folder.path());
+        let bytes = fs::read(fixture_source("windows-1250-romanian")).unwrap();
+        upload_bytes(&app, "Film.srt", bytes).await;
+        let id = first_file_id(&app).await;
+        let (status, body) = call(&app, Method::GET, &file_route(&id, "output"), None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["reason"], "not-converted");
+        let unknown = file_route(&json!(u64::MAX), "output");
+        let (status, body) = call(&app, Method::GET, &unknown, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["reason"], "unknown-file");
+    }
+
+    /// UI-19: the page's language suggestions come from the hint table (ENC-13).
+    #[tokio::test]
+    async fn languages_are_published() {
+        let folder = tempfile::tempdir().unwrap();
+        let app = test_app(folder.path(), folder.path());
+        let (status, body) = call(&app, Method::GET, &route(LANGUAGES_ROUTE), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["hinted"], json!(hinted_languages()));
+        assert_eq!(body["hinted"][0], "ro");
+    }
+
+    /// NAME-11: a name that is not UTF-8 is added by its bytes, read in the file's encoding,
+    /// converted to a UTF-8 name beside the untouched original, offered by Browse, and its
+    /// output is recognised when the folder is added again (SAFE-18).
+    #[tokio::test]
+    async fn legacy_name_is_listed_and_converted_with_a_utf8_name() {
+        let folder = tempfile::tempdir().unwrap();
+        let app = test_app(folder.path(), folder.path());
+        let original = fs::read(fixture_source("windows-1250-romanian")).unwrap();
+        let legacy = fs::canonicalize(folder.path())
+            .unwrap()
+            .join(OsStr::from_bytes(b"Fat\xe3.srt"));
+        fs::write(&legacy, &original).unwrap();
+        let by_bytes = json!({ "hex": encode_hex(legacy.as_os_str().as_bytes()) });
+        let (status, _) = post(&app, ADD_ROUTE, json!({ "paths": [by_bytes] })).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, state) = call(&app, Method::GET, &route(STATE_ROUTE), None).await;
+        let file = &state["files"][0];
+        assert_eq!(file["name"], "Fată.srt");
+        assert_eq!(file["status"], "ready");
+        assert_eq!(file["encoding"], "windows-1250");
+
+        call(&app, Method::POST, &route(CONVERT_ROUTE), None).await;
+        wait_for_conversion(&app).await;
+        let written = fs::read_to_string(folder.path().join("Fată1.srt")).unwrap();
+        assert_eq!(written, fixture_output("windows-1250-romanian"));
+        assert_eq!(fs::read(&legacy).unwrap(), original);
+
+        let (_, listing) = post(&app, BROWSE_ROUTE, json!({ "path": folder.path() })).await;
+        assert_eq!(listing["files"], json!(["Fată1.srt"]));
+        assert_eq!(listing["rawFiles"][0]["display"], "Fat\u{FFFD}.srt");
+        assert_eq!(listing["rawFiles"][0]["hex"], by_bytes["hex"]);
+
+        call(&app, Method::POST, &route(CLEAR_ROUTE), None).await;
+        post(&app, ADD_ROUTE, json!({ "paths": [folder.path()] })).await;
+        let (_, state) = call(&app, Method::GET, &route(STATE_ROUTE), None).await;
+        let copy = state["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["name"] == "Fată1.srt")
+            .unwrap();
+        assert_eq!(copy["problem"]["reason"], "converted-copy");
+        assert_eq!(copy["problem"]["relatedName"], "Fată.srt");
+
+        let bad = json!({ "paths": [{ "hex": "2f7" }] });
+        let (status, body) = post(&app, ADD_ROUTE, bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["reason"], "invalid-path");
+    }
+
+    async fn post_to(app: &axum::Router, full_route: &str, body: Value) -> (StatusCode, Value) {
+        call(app, Method::POST, full_route, Some(body)).await
     }
 }

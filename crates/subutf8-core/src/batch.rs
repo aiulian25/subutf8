@@ -4,15 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use encoding_rs::Encoding;
 use tempfile::Builder;
 
 use crate::constants::{
     MAXIMUM_LISTED_FILES, TEMPORARY_FILE_PREFIX, TEMPORARY_FILE_SUFFIX, UTF8_BYTE_ORDER_MARK,
 };
-use crate::decoding::convert;
-use crate::language::SubtitleLanguage;
-use crate::output_naming::{Placement, candidate_names, check_name_length};
+use crate::decoding::{Reading, convert_reading};
+use crate::language::{SubtitleLanguage, written_text};
+use crate::output_naming::{Placement, candidate_names, check_name_length, readable_name};
 use crate::report::{FailureCause, Outcome, SkipCause};
 use crate::safe_write::{WriteError, WriteMode, output_permissions, write_verified};
 use crate::source_file::{ReadError, read_source};
@@ -50,12 +49,13 @@ impl DayFolder {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchSettings {
-    pub language: Option<SubtitleLanguage>,
     pub destination: Destination,
     pub output_folder: PathBuf,
     /// NAME-10: outputs in the output folder go into this day's folder.
     pub day_folder: Option<DayFolder>,
     pub collision_policy: CollisionPolicy,
+    /// ENC-23: Romanian subtitles are written with ș ț.
+    pub romanian_comma_letters: bool,
 }
 
 impl BatchSettings {
@@ -81,8 +81,11 @@ pub enum Origin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversionJob {
     pub origin: Origin,
-    /// The detected or chosen encoding; a byte-order mark overrides it (ENC-12).
-    pub encoding: &'static Encoding,
+    /// The detected or chosen reading; a byte-order mark overrides a whole-file encoding
+    /// (ENC-12), and a mixed file may keep its UTF-8 lines (ENC-21).
+    pub reading: Reading,
+    /// NAME-02 and UI-16: this file's subtitle language, for its output name.
+    pub language: Option<SubtitleLanguage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +115,7 @@ pub fn run_batch(
     for (job, plan) in jobs.iter().zip(plans) {
         let outcome = match plan {
             _ if cancel.load(Ordering::Relaxed) => Outcome::NotReached,
-            Ok(planned) => convert_and_write(job, &planned),
+            Ok(planned) => convert_and_write(job, &planned, settings),
             Err(outcome) => outcome,
         };
         let progress = Progress {
@@ -134,28 +137,40 @@ fn plan_destinations(
     let mut writable_folders = HashMap::new();
     jobs.iter()
         .map(|job| {
-            let (folder, name, placement) = destination_parts(job, settings);
+            let Some((folder, name, placement)) = destination_parts(job, settings) else {
+                return Err(Outcome::Skipped(SkipCause::NameNotDecodable));
+            };
             let is_writable = *writable_folders
                 .entry(folder.clone())
                 .or_insert_with(|| folder_is_writable(&folder));
             if !is_writable {
                 return Err(Outcome::Skipped(SkipCause::FolderNotWritable));
             }
-            let planned = choose_name(&folder, &name, placement, settings, listed_paths, &taken)?;
+            let language = job.language.as_ref();
+            let planned = choose_name(
+                &folder,
+                &name,
+                language,
+                placement,
+                settings,
+                listed_paths,
+                &taken,
+            )?;
             taken.insert(planned.destination.clone());
             Ok(planned)
         })
         .collect()
 }
 
+/// NAME-11: outputs are named after the original's readable name; None when there is none.
 fn destination_parts(
     job: &ConversionJob,
     settings: &BatchSettings,
-) -> (PathBuf, String, Placement) {
-    match &job.origin {
+) -> Option<(PathBuf, String, Placement)> {
+    let parts = match &job.origin {
         Origin::Disk { path, .. } if settings.destination == Destination::BesideOriginals => (
             path.parent().map(Path::to_path_buf).unwrap_or_default(),
-            file_name(path),
+            readable_name(path.file_name()?, job.reading.encoding())?,
             Placement::BesideOriginal,
         ),
         Origin::Disk {
@@ -163,7 +178,7 @@ fn destination_parts(
             relative_folder,
         } => (
             settings.output_folder().join(relative_folder),
-            file_name(path),
+            readable_name(path.file_name()?, job.reading.encoding())?,
             Placement::OutputFolder,
         ),
         Origin::Dropped { name, .. } => (
@@ -171,7 +186,8 @@ fn destination_parts(
             name.clone(),
             Placement::OutputFolder,
         ),
-    }
+    };
+    Some(parts)
 }
 
 fn file_name(path: &Path) -> String {
@@ -194,16 +210,17 @@ pub fn folder_is_writable(folder: &Path) -> bool {
 }
 
 /// SAFE-04 and SAFE-05: an earlier file in the list keeps a name, and later ones are
-/// treated as if it already existed.
+/// treated as if it already existed. `language` is the job's own (NAME-02).
 fn choose_name(
     folder: &Path,
     original_name: &str,
+    language: Option<&SubtitleLanguage>,
     placement: Placement,
     settings: &BatchSettings,
     listed_paths: &HashSet<PathBuf>,
     taken: &HashSet<PathBuf>,
 ) -> Result<PlannedWrite, Outcome> {
-    let mut candidates = candidate_names(original_name, settings.language.as_ref(), placement)
+    let mut candidates = candidate_names(original_name, language, placement)
         .map_err(|_| Outcome::Failed(FailureCause::NameTooLong))?
         .map(|name| folder.join(name));
     let first = candidates.next().unwrap_or_default();
@@ -247,21 +264,32 @@ fn is_listed(path: &Path, listed_paths: &HashSet<PathBuf>) -> bool {
     listed_paths.contains(&real) || listed_paths.contains(path)
 }
 
-fn convert_and_write(job: &ConversionJob, planned: &PlannedWrite) -> Outcome {
+/// ENC-16: the written file is checked against exactly the text written, Romanian letters
+/// included (ENC-23).
+fn convert_and_write(
+    job: &ConversionJob,
+    planned: &PlannedWrite,
+    settings: &BatchSettings,
+) -> Outcome {
     let (bytes, original) = match read_origin(&job.origin) {
         Ok(read) => read,
         Err(outcome) => return outcome,
     };
-    let conversion = match convert(&bytes, job.encoding) {
+    let conversion = match convert_reading(&bytes, job.reading) {
         Ok(conversion) => conversion,
         Err(failure) => return Outcome::Failed(FailureCause::Conversion(failure)),
     };
+    let text = written_text(
+        &conversion.text,
+        job.language.as_ref(),
+        settings.romanian_comma_letters,
+    );
     let folder = planned.destination.parent().unwrap_or(Path::new(""));
     if let Err(error) = fs::create_dir_all(folder) {
         return Outcome::Failed(FailureCause::WriteFailed(error.kind()));
     }
     let permissions = output_permissions(original.as_ref());
-    let output = [UTF8_BYTE_ORDER_MARK, &conversion.text].concat();
+    let output = [UTF8_BYTE_ORDER_MARK, &text].concat();
     let written = write_verified(
         &planned.destination,
         &output,
@@ -271,7 +299,7 @@ fn convert_and_write(job: &ConversionJob, planned: &PlannedWrite) -> Outcome {
     match written {
         Ok(()) => Outcome::Converted {
             output: planned.destination.clone(),
-            structure_warnings: check_structure(&conversion.text),
+            structure_warnings: check_structure(&text),
             warnings: conversion.warnings,
         },
         Err(error) => write_error_outcome(error),
@@ -314,18 +342,20 @@ mod tests {
     use crate::detection::{Detection, detect};
     use crate::report::Summary;
     use crate::test_fixtures::{expected, source, source_path};
-    use encoding_rs::{ISO_8859_2, UTF_8, WINDOWS_1250};
+    use encoding_rs::{Encoding, ISO_8859_2, UTF_8, WINDOWS_1250};
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
     const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/golden.sha256");
 
     fn settings(output_folder: &Path, collision_policy: CollisionPolicy) -> BatchSettings {
         BatchSettings {
-            language: None,
             destination: Destination::OutputFolder,
             output_folder: output_folder.to_path_buf(),
             day_folder: None,
             collision_policy,
+            romanian_comma_letters: false,
         }
     }
 
@@ -335,7 +365,8 @@ mod tests {
                 path: path.to_path_buf(),
                 relative_folder: PathBuf::new(),
             },
-            encoding,
+            reading: Reading::Whole(encoding),
+            language: None,
         }
     }
 
@@ -345,8 +376,13 @@ mod tests {
                 name: String::from(name),
                 bytes: Arc::from(source(fixture)),
             },
-            encoding,
+            reading: Reading::Whole(encoding),
+            language: None,
         }
+    }
+
+    fn language(tag: &str) -> Option<SubtitleLanguage> {
+        Some(SubtitleLanguage::parse(tag).unwrap())
     }
 
     fn run(jobs: &[ConversionJob], settings: &BatchSettings) -> Vec<Outcome> {
@@ -557,8 +593,11 @@ mod tests {
         let mut beside = settings(folder.path(), CollisionPolicy::Skip);
         beside.destination = Destination::BesideOriginals;
         run(&[disk_job(&original, WINDOWS_1250)], &beside);
-        beside.language = Some(SubtitleLanguage::parse("ro").unwrap());
-        run(&[disk_job(&original, WINDOWS_1250)], &beside);
+        let tagged = ConversionJob {
+            language: language("ro"),
+            ..disk_job(&original, WINDOWS_1250)
+        };
+        run(&[tagged], &beside);
         assert_eq!(
             output_names(folder.path()),
             ["Film.ro.srt", "Film.srt", "Film1.srt"]
@@ -569,7 +608,8 @@ mod tests {
                 path: original,
                 relative_folder: PathBuf::from("Show/S01"),
             },
-            encoding: WINDOWS_1250,
+            reading: Reading::Whole(WINDOWS_1250),
+            language: None,
         };
         run(&[nested], &settings(output.path(), CollisionPolicy::Skip));
         assert!(output.path().join("Show/S01/Film.srt").is_file());
@@ -590,7 +630,8 @@ mod tests {
                 path: original.clone(),
                 relative_folder: PathBuf::from("Show"),
             },
-            encoding: WINDOWS_1250,
+            reading: Reading::Whole(WINDOWS_1250),
+            language: None,
         };
         let jobs = [
             nested,
@@ -602,5 +643,74 @@ mod tests {
         by_day.destination = Destination::BesideOriginals;
         run(&[disk_job(&original, WINDOWS_1250)], &by_day);
         assert_eq!(output_names(folder.path()), ["Film.srt", "Film1.srt"]);
+    }
+
+    /// NAME-02 and UI-16: each file's output is tagged with its own language.
+    #[test]
+    fn each_job_uses_its_own_language() {
+        let output = tempfile::tempdir().unwrap();
+        let jobs = [
+            ConversionJob {
+                language: language("ro"),
+                ..dropped_job("Film.srt", "windows-1250-romanian", WINDOWS_1250)
+            },
+            ConversionJob {
+                language: language("en"),
+                ..dropped_job("Other.srt", "ascii-only", UTF_8)
+            },
+        ];
+        run(&jobs, &settings(output.path(), CollisionPolicy::Skip));
+        assert_eq!(output_names(output.path()), ["Film.ro.srt", "Other.en.srt"]);
+    }
+
+    /// ENC-23 and ENC-16: with comma letters chosen, only the Romanian file takes them, and it
+    /// is verified as written.
+    #[test]
+    fn romanian_letters_follow_the_setting() {
+        let output = tempfile::tempdir().unwrap();
+        let mut comma_letters = settings(output.path(), CollisionPolicy::Skip);
+        comma_letters.romanian_comma_letters = true;
+        let jobs = [
+            ConversionJob {
+                language: language("ro"),
+                ..dropped_job("Film.srt", "windows-1250-romanian", WINDOWS_1250)
+            },
+            ConversionJob {
+                language: language("en"),
+                ..dropped_job("Film.srt", "windows-1250-romanian", WINDOWS_1250)
+            },
+        ];
+        let outcomes = run(&jobs, &comma_letters);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, Outcome::Converted { .. }))
+        );
+        let romanian = fs::read_to_string(output.path().join("Film.ro.srt")).unwrap();
+        assert!(romanian.contains("dimineața") && !romanian.contains('ţ'));
+        assert_eq!(
+            fs::read_to_string(output.path().join("Film.en.srt")).unwrap(),
+            expected_output("windows-1250-romanian")
+        );
+    }
+
+    /// NAME-11: a legacy name gives a UTF-8 output name; one that does not decode in the
+    /// file's encoding is skipped, and the original is never touched.
+    #[test]
+    fn legacy_names_get_readable_output_names() {
+        let folder = tempfile::tempdir().unwrap();
+        let legacy = folder.path().join(OsStr::from_bytes(b"Fat\xe3.srt"));
+        fs::write(&legacy, source("windows-1250-romanian")).unwrap();
+        let mut beside = settings(folder.path(), CollisionPolicy::Skip);
+        beside.destination = Destination::BesideOriginals;
+        let jobs = [disk_job(&legacy, WINDOWS_1250), disk_job(&legacy, UTF_8)];
+        let outcomes = run(&jobs, &beside);
+        assert!(matches!(outcomes[0], Outcome::Converted { .. }));
+        assert_eq!(outcomes[1], Outcome::Skipped(SkipCause::NameNotDecodable));
+        assert_eq!(
+            fs::read_to_string(folder.path().join("Fată1.srt")).unwrap(),
+            expected_output("windows-1250-romanian")
+        );
+        assert_eq!(fs::read(&legacy).unwrap(), source("windows-1250-romanian"));
     }
 }

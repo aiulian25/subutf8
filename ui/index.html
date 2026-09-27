@@ -59,6 +59,12 @@
           <button type="button" id="clear-button" class="quiet-button">Clear list</button>
         </div>
         <p id="list-message" class="list-message" aria-live="polite" hidden></p>
+        <button
+          type="button"
+          id="write-skipped-button"
+          class="primary-button write-skipped-button"
+          hidden
+        ></button>
 
         <div class="table-scroll">
           <table class="file-table" aria-labelledby="files-heading" aria-multiselectable="true">
@@ -84,46 +90,13 @@
     </main>
 
     <footer class="bottom-bar">
-      <div class="settings">
-        <label class="setting">
-          <span>Subtitle language</span>
-          <input
-            id="language-input"
-            list="language-list"
-            autocomplete="off"
-            spellcheck="false"
-            placeholder="none"
-            size="6"
-          />
-        </label>
-        <datalist id="language-list"></datalist>
-        <label class="setting">
-          <span>Write to</span>
-          <select id="destination-select"></select>
-        </label>
-        <div class="setting output-folder">
-          <span>Output folder</span>
-          <span class="output-folder-row">
-            <span id="output-folder-path" class="path"></span>
-            <button type="button" id="output-folder-button" class="quiet-button">Change…</button>
-          </span>
-          <label class="checkbox-label">
-            <input type="checkbox" id="by-day-checkbox" />
-            A folder for each day
-          </label>
-        </div>
-        <label class="setting">
-          <span>If the output exists</span>
-          <select id="collision-select"></select>
-        </label>
-        <p id="settings-message" class="settings-message" role="alert" hidden></p>
-      </div>
       <div class="actions">
         <div class="progress-area">
           <progress id="progress" max="1" value="0" hidden></progress>
           <p id="summary" class="summary" aria-live="polite"></p>
         </div>
         <button type="button" id="cancel-button" hidden>Cancel</button>
+        <button type="button" id="download-all-button" hidden></button>
         <button type="button" id="convert-button" class="primary-button">Convert to UTF-8</button>
       </div>
     </footer>
@@ -200,10 +173,7 @@
     >
       <div class="dialog-heading">
         <h2 id="settings-title">Settings</h2>
-        <p class="muted">
-          SubUTF8 starts with these each time. The bar at the bottom changes only what you are
-          converting now.
-        </p>
+        <p class="muted">Every conversion uses these, and SubUTF8 keeps them for next time.</p>
       </div>
       <p id="settings-notice" class="dialog-notice" role="alert" hidden></p>
       <div class="settings-body">
@@ -218,7 +188,14 @@
               spellcheck="false"
               placeholder="none"
               size="6"
+              aria-describedby="language-hint"
             />
+          </label>
+          <p id="language-hint" class="setting-hint" aria-live="polite"></p>
+          <datalist id="language-list"></datalist>
+          <label id="romanian-letters-setting" class="setting" hidden>
+            <span>Romanian letters</span>
+            <select id="default-romanian-letters"></select>
           </label>
           <label class="setting">
             <span>Write to</span>
@@ -235,7 +212,7 @@
           </div>
           <label class="checkbox-label">
             <input type="checkbox" id="default-by-day" />
-            Put outputs in a folder for each day, such as 2026-09-27
+            In the output folder, a folder for each day, such as 2026-09-27
           </label>
           <label class="setting">
             <span>If the output exists</span>
@@ -268,7 +245,7 @@
           <div id="update-card" class="update-card" tabindex="-1" aria-live="polite"></div>
           <label class="checkbox-label">
             <input type="checkbox" id="default-update-check" />
-            Check for updates once a day
+            Check automatically once a day
           </label>
         </section>
       </div>
@@ -279,6 +256,20 @@
           <button type="button" id="settings-cancel">Cancel</button>
           <button type="button" id="settings-save" class="primary-button">Save</button>
         </span>
+      </div>
+    </dialog>
+
+    <dialog
+      id="update-prompt"
+      class="app-dialog update-prompt"
+      aria-labelledby="update-prompt-title"
+    >
+      <h2 id="update-prompt-title"></h2>
+      <div id="update-prompt-body" class="update-prompt-body"></div>
+      <p id="update-prompt-message" class="dialog-message" role="alert" hidden></p>
+      <div class="dialog-buttons update-prompt-buttons">
+        <button type="button" id="update-prompt-later"></button>
+        <button type="button" id="update-prompt-act" class="primary-button"></button>
       </div>
     </dialog>
 

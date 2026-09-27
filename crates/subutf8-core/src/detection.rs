@@ -1,11 +1,18 @@
+use std::collections::HashSet;
+
 use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
-use encoding_rs::Encoding;
+use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE};
 
 use crate::classification::{Classification, count_non_ascii};
-use crate::constants::MINIMUM_DETECTION_EVIDENCE_BYTES;
-use crate::decoding::{DecodingProblem, decode_strictly};
+use crate::constants::{C1_CONTROL_CHARACTERS, CANDIDATE_LIMIT, MINIMUM_DETECTION_EVIDENCE_BYTES};
+use crate::decoding::{
+    ConversionFailure, DecodingProblem, MisreadVia, Misreading, Reading, convert_reading,
+    decode_strictly, misread_bytes,
+};
 use crate::encoding_catalog::manual_choices;
-use crate::language::SubtitleLanguage;
+use crate::language::{SubtitleLanguage, detection_domains};
+use crate::preview::sample_line;
+use crate::srt_structure::split_byte_lines;
 
 /// The outcome of ENC-10 for a file that needs detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +47,13 @@ pub enum ManualChoiceRefusal {
     DoesNotDecode(DecodingProblem),
 }
 
+/// UI-15: an encoding a person may want, with a line to recognise it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub encoding: &'static Encoding,
+    pub sample: String,
+}
+
 /// ENC-09 to ENC-11 and ENC-13, for a file classified as needing detection.
 pub fn detect(bytes: &[u8], language: Option<&SubtitleLanguage>) -> Detection {
     let mut detector = EncodingDetector::new(Iso2022JpDetection::Deny);
@@ -65,21 +79,138 @@ fn needs_review(suggestion: &'static Encoding, reason: ReviewReason) -> Detectio
     Detection::NeedsReview { suggestion, reason }
 }
 
-/// ENC-12: whether a hand-chosen encoding can be used for a file.
-pub fn check_manual_choice(
+/// ENC-22: how UTF-8 text was garbled, when it turns back without loss into bytes that decode
+/// strictly to other text. Text with C1 characters was read through Latin-1, else through
+/// windows-1252.
+pub fn find_misreading(text: &str, language: Option<&SubtitleLanguage>) -> Option<Misreading> {
+    if text.is_ascii() {
+        return None;
+    }
+    let has_c1_characters = text
+        .chars()
+        .any(|character| C1_CONTROL_CHARACTERS.contains(&character));
+    let via = if has_c1_characters {
+        MisreadVia::Latin1
+    } else {
+        MisreadVia::Windows1252
+    };
+    let bytes = misread_bytes(text, via)?;
+    let original = original_encoding(&bytes, via, language)?;
+    let repaired = decode_strictly(&bytes, original).ok()?;
+    (repaired != text).then_some(Misreading { via, original })
+}
+
+/// ENC-22: UTF-8 when the bytes are valid UTF-8, else the detector's encoding. It must be
+/// certain, so real accented UTF-8 text is not taken for garbled, unless C1 characters, which
+/// subtitles never use, already show the misreading.
+fn original_encoding(
+    bytes: &[u8],
+    via: MisreadVia,
+    language: Option<&SubtitleLanguage>,
+) -> Option<&'static Encoding> {
+    if std::str::from_utf8(bytes).is_ok() {
+        return Some(UTF_8);
+    }
+    match (via, detect(bytes, language)) {
+        (_, Detection::Certain(encoding))
+        | (
+            MisreadVia::Latin1,
+            Detection::NeedsReview {
+                suggestion: encoding,
+                ..
+            },
+        ) => Some(encoding),
+        (MisreadVia::Windows1252, Detection::NeedsReview { .. }) => None,
+    }
+}
+
+/// ENC-12 and ENC-21: whether a hand-chosen reading can be used for a file. Keeping UTF-8 lines
+/// applies to damaged or mixed files only. The file must convert with it.
+pub fn check_manual_reading(
+    bytes: &[u8],
+    classification: Classification,
+    reading: Reading,
+) -> Result<(), ManualChoiceRefusal> {
+    if !manual_choices().contains(&reading.encoding()) {
+        return Err(ManualChoiceRefusal::NotOffered);
+    }
+    let keeps_utf8_lines = matches!(reading, Reading::Utf8LinesElse(_));
+    let is_mixed = classification == Classification::DamagedOrMixedUtf8;
+    if !takes_manual_choice(classification) || (keeps_utf8_lines && !is_mixed) {
+        return Err(ManualChoiceRefusal::NotApplicable);
+    }
+    convert_reading(bytes, reading)
+        .map(|_| ())
+        .map_err(|failure| match failure {
+            ConversionFailure::DoesNotDecode(problem) => {
+                ManualChoiceRefusal::DoesNotDecode(problem)
+            }
+            other => ManualChoiceRefusal::DoesNotDecode(DecodingProblem::InvalidBytes {
+                location: other.location(),
+            }),
+        })
+}
+
+/// UI-15: offered encodings that decode the file strictly, most likely first, at most
+/// CANDIDATE_LIMIT. Files that take no hand-chosen encoding have none.
+pub fn candidates(
+    bytes: &[u8],
+    classification: Classification,
+    language: Option<&SubtitleLanguage>,
+) -> Vec<Candidate> {
+    if !takes_manual_choice(classification) {
+        return Vec::new();
+    }
+    let mut tried = HashSet::new();
+    candidate_order(bytes, classification, language)
+        .into_iter()
+        .filter(|encoding| manual_choices().contains(encoding) && tried.insert(*encoding))
+        .filter_map(|encoding| {
+            let sample = candidate_sample(bytes, classification, encoding)?;
+            Some(Candidate { encoding, sample })
+        })
+        .take(CANDIDATE_LIMIT)
+        .collect()
+}
+
+/// UI-15 and ENC-21: a mixed file is read with its UTF-8 lines kept, and shown by its first line
+/// that is not UTF-8, which is the one the encoding decides.
+fn candidate_sample(
     bytes: &[u8],
     classification: Classification,
     encoding: &'static Encoding,
-) -> Result<(), ManualChoiceRefusal> {
-    if !manual_choices().contains(&encoding) {
-        return Err(ManualChoiceRefusal::NotOffered);
+) -> Option<String> {
+    if classification != Classification::DamagedOrMixedUtf8 {
+        return decode_strictly(bytes, encoding)
+            .ok()
+            .map(|text| sample_line(&text));
     }
-    if !takes_manual_choice(classification) {
-        return Err(ManualChoiceRefusal::NotApplicable);
+    convert_reading(bytes, Reading::Utf8LinesElse(encoding)).ok()?;
+    let line = split_byte_lines(bytes).find(|line| std::str::from_utf8(line).is_err())?;
+    decode_strictly(line, encoding)
+        .ok()
+        .map(|text| sample_line(&text))
+}
+
+/// UTF-16 in the byte order its pattern suggests, then the other. Otherwise the detector's
+/// guess for the subtitle language, its guess without one, then its guess for each hint
+/// domain, as every one steers it towards another family of encodings.
+fn candidate_order(
+    bytes: &[u8],
+    classification: Classification,
+    language: Option<&SubtitleLanguage>,
+) -> Vec<&'static Encoding> {
+    if let Classification::LooksLikeUtf16WithoutByteOrderMark(likely) = classification {
+        return vec![likely, UTF_16LE, UTF_16BE];
     }
-    decode_strictly(bytes, encoding)
-        .map(|_| ())
-        .map_err(ManualChoiceRefusal::DoesNotDecode)
+    let mut detector = EncodingDetector::new(Iso2022JpDetection::Deny);
+    detector.feed(bytes, true);
+    let language_hint = language.and_then(SubtitleLanguage::detection_hint);
+    [language_hint, None]
+        .into_iter()
+        .chain(detection_domains().into_iter().map(Some))
+        .map(|hint| detector.guess(hint.map(str::as_bytes), Utf8Detection::Deny))
+        .collect()
 }
 
 /// ENC-12: files identified by a byte-order mark, valid UTF-8, empty or not text take no
@@ -97,6 +228,7 @@ pub fn takes_manual_choice(classification: Classification) -> bool {
 mod tests {
     use super::*;
     use crate::classification::classify;
+    use crate::decoding::Location;
     use crate::test_fixtures::{expected, source};
     use encoding_rs::{
         BIG5, EUC_JP, EUC_KR, GBK, IBM866, ISO_2022_JP, ISO_8859_2, ISO_8859_4, ISO_8859_5,
@@ -244,7 +376,11 @@ mod tests {
         };
         assert_eq!(decode_strictly(&bytes, detected).unwrap(), cedilla_text);
         assert_eq!(
-            check_manual_choice(&bytes, Classification::NeedsDetection, ISO_8859_16),
+            check_manual_reading(
+                &bytes,
+                Classification::NeedsDetection,
+                Reading::Whole(ISO_8859_16)
+            ),
             Ok(())
         );
         assert_eq!(decode_strictly(&bytes, ISO_8859_16).unwrap(), text);
@@ -255,7 +391,7 @@ mod tests {
     fn utf16_without_bom_is_exact_after_manual_choice() {
         let bytes = source("utf16le-no-bom");
         assert_eq!(
-            check_manual_choice(&bytes, classify(&bytes), UTF_16LE),
+            check_manual_reading(&bytes, classify(&bytes), Reading::Whole(UTF_16LE)),
             Ok(())
         );
         assert_eq!(
@@ -264,21 +400,33 @@ mod tests {
         );
     }
 
-    /// ENC-11 and ENC-12: ISO-8859-2 lacks the typographic quotes of windows-1250.
+    /// ENC-11 and ENC-12: ISO-8859-2 lacks the typographic quotes of windows-1250, and the
+    /// first one is on line 3.
     #[test]
     fn manual_choice_is_strictly_decoded() {
         let bytes = source("markup");
         let first_quote = bytes.iter().position(|byte| *byte == 0x84).unwrap();
         assert_eq!(
-            check_manual_choice(&bytes, Classification::NeedsDetection, ISO_8859_2),
+            check_manual_reading(
+                &bytes,
+                Classification::NeedsDetection,
+                Reading::Whole(ISO_8859_2)
+            ),
             Err(ManualChoiceRefusal::DoesNotDecode(
                 DecodingProblem::ControlCharacter {
-                    byte_offset: first_quote
+                    location: Location {
+                        byte_offset: first_quote,
+                        line: 3
+                    }
                 }
             ))
         );
         assert!(matches!(
-            check_manual_choice(&bytes, Classification::NeedsDetection, SHIFT_JIS),
+            check_manual_reading(
+                &bytes,
+                Classification::NeedsDetection,
+                Reading::Whole(SHIFT_JIS)
+            ),
             Err(ManualChoiceRefusal::DoesNotDecode(
                 DecodingProblem::InvalidBytes { .. }
             ))
@@ -291,18 +439,50 @@ mod tests {
         let without_choice = [
             Classification::Empty,
             Classification::Utf8WithByteOrderMark,
-            Classification::DamagedUtf8WithByteOrderMark { byte_offset: 0 },
+            Classification::DamagedUtf8WithByteOrderMark {
+                location: Location {
+                    byte_offset: 0,
+                    line: 1,
+                },
+            },
             Classification::Utf16WithByteOrderMark(UTF_16LE),
             Classification::Utf8WithoutByteOrderMark,
             Classification::NotText,
         ];
         for classification in without_choice {
             assert_eq!(
-                check_manual_choice(b"text", classification, WINDOWS_1250),
+                check_manual_reading(b"text", classification, Reading::Whole(WINDOWS_1250)),
                 Err(ManualChoiceRefusal::NotApplicable),
                 "{classification:?}"
             );
         }
+        let keep_utf8_lines = Reading::Utf8LinesElse(WINDOWS_1250);
+        assert_eq!(
+            check_manual_reading(b"text", Classification::NeedsDetection, keep_utf8_lines),
+            Err(ManualChoiceRefusal::NotApplicable)
+        );
+    }
+
+    /// ENC-12 and ENC-21: a mixed file fits windows-1250 only with its UTF-8 lines kept.
+    #[test]
+    fn mixed_file_takes_a_reading_that_keeps_utf8_lines() {
+        let bytes = source("mixed-utf8-1250");
+        let mixed = Classification::DamagedOrMixedUtf8;
+        assert_eq!(
+            check_manual_reading(&bytes, mixed, Reading::Utf8LinesElse(WINDOWS_1250)),
+            Ok(())
+        );
+        assert!(matches!(
+            check_manual_reading(&bytes, mixed, Reading::Whole(WINDOWS_1250)),
+            Err(ManualChoiceRefusal::DoesNotDecode(_))
+        ));
+        let found = candidates(&bytes, mixed, Some(&language("ro")));
+        assert!(
+            found
+                .iter()
+                .any(|candidate| candidate.encoding == WINDOWS_1250
+                    && candidate.sample == "Bună dimineaţa! Ştii ce înseamnă asta?")
+        );
     }
 
     /// ENC-12 and UI-09.
@@ -311,7 +491,11 @@ mod tests {
         let bytes = source("mixed-utf8-1250");
         for encoding in [UTF_8, ISO_2022_JP] {
             assert_eq!(
-                check_manual_choice(&bytes, Classification::DamagedOrMixedUtf8, encoding),
+                check_manual_reading(
+                    &bytes,
+                    Classification::DamagedOrMixedUtf8,
+                    Reading::Whole(encoding)
+                ),
                 Err(ManualChoiceRefusal::NotOffered),
                 "{}",
                 encoding.name()
@@ -365,5 +549,138 @@ mod tests {
             }) = detect(bytes, None);
             assert!(guess != UTF_8 && guess != ISO_2022_JP, "{}", guess.name());
         }
+    }
+
+    /// UI-15: the guess for the language comes first and reads correctly.
+    #[test]
+    fn short_romanian_candidates_are_readable() {
+        let bytes = source("short-romanian");
+        let found = candidates(
+            &bytes,
+            Classification::NeedsDetection,
+            Some(&language("ro")),
+        );
+        assert!(
+            found.len() > 1 && found.len() <= CANDIDATE_LIMIT,
+            "{found:?}"
+        );
+        assert_eq!(found[0].sample, "Bună!");
+        for candidate in &found {
+            assert!(manual_choices().contains(&candidate.encoding));
+            assert!(decode_strictly(&bytes, candidate.encoding).is_ok());
+        }
+        let mut encodings: Vec<&str> = found.iter().map(|found| found.encoding.name()).collect();
+        encodings.sort_unstable();
+        encodings.dedup();
+        assert_eq!(encodings.len(), found.len());
+    }
+
+    /// UI-15.
+    #[test]
+    fn utf16_candidates_come_from_the_byte_pattern() {
+        let bytes = source("utf16le-no-bom");
+        let found = candidates(&bytes, classify(&bytes), None);
+        assert_eq!(found[0].encoding, UTF_16LE);
+        assert!(!found[0].sample.is_empty());
+    }
+
+    /// UI-15.
+    #[test]
+    fn utf8_files_have_no_candidates() {
+        let bytes = source("utf8-romanian");
+        assert!(candidates(&bytes, Classification::Utf8WithoutByteOrderMark, None).is_empty());
+    }
+
+    /// ENC-22.
+    #[test]
+    fn garbled_romanian_is_windows_1250_read_as_windows_1252() {
+        let bytes = source("garbled-romanian");
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let misreading = find_misreading(text, Some(&language("ro"))).unwrap();
+        assert_eq!(
+            misreading,
+            Misreading {
+                via: MisreadVia::Windows1252,
+                original: WINDOWS_1250
+            }
+        );
+        let reading = Reading::RepairMisreading(misreading);
+        assert_eq!(reading.name(), "windows-1250 (repaired)");
+        let without_language = Reading::RepairMisreading(find_misreading(text, None).unwrap());
+        for reading in [reading, without_language] {
+            assert_eq!(
+                convert_reading(&bytes, reading).unwrap().text,
+                expected("windows-1250-romanian")
+            );
+        }
+    }
+
+    /// ENC-22: real accented UTF-8 text is left alone, whatever the subtitle language.
+    #[test]
+    fn real_utf8_text_is_not_a_misreading() {
+        let fixtures = [
+            "utf8-romanian",
+            "windows-1252-french",
+            "ascii-only",
+            "markup",
+            "iso-8859-16-romanian",
+            "windows-1251-russian",
+            "windows-1253-greek",
+            "windows-1256-arabic",
+            "shift-jis-japanese",
+            "euc-kr-korean",
+        ];
+        for fixture in fixtures {
+            let text = expected(fixture);
+            for tag in [None, Some("ro"), Some("fr")] {
+                let subtitle_language = tag.map(language);
+                assert_eq!(
+                    find_misreading(&text, subtitle_language.as_ref()),
+                    None,
+                    "{fixture} with {tag:?}"
+                );
+            }
+        }
+    }
+
+    /// ENC-22: UTF-8 read as windows-1252 turns back into the UTF-8 it was.
+    #[test]
+    fn utf8_read_as_windows_1252_is_found() {
+        let bytes = source("utf8-romanian");
+        let (garbled, _, _) = WINDOWS_1252.decode(&bytes);
+        let misreading = find_misreading(&garbled, None).unwrap();
+        assert_eq!(
+            misreading,
+            Misreading {
+                via: MisreadVia::Windows1252,
+                original: UTF_8
+            }
+        );
+        let repaired = convert_reading(garbled.as_bytes(), Reading::RepairMisreading(misreading));
+        assert_eq!(repaired.unwrap().text, expected("utf8-romanian"));
+    }
+
+    /// ENC-22: C1 characters show text read through Latin-1, and are undone through it. The
+    /// windows-1252 dash U+0096 is what 1.0.0 refused with nothing left to choose.
+    #[test]
+    fn c1_characters_are_undone_through_latin1() {
+        let bytes = source("markup");
+        let as_latin1: String = bytes.iter().map(|byte| char::from(*byte)).collect();
+        let misreading = find_misreading(&as_latin1, Some(&language("ro"))).unwrap();
+        assert_eq!(
+            misreading,
+            Misreading {
+                via: MisreadVia::Latin1,
+                original: WINDOWS_1250
+            }
+        );
+        let repaired = convert_reading(as_latin1.as_bytes(), Reading::RepairMisreading(misreading));
+        assert_eq!(repaired.unwrap().text, expected("markup"));
+
+        let dash = "Un \u{96} doi";
+        let misreading = find_misreading(dash, None).unwrap();
+        assert_eq!(misreading.via, MisreadVia::Latin1);
+        let repaired = convert_reading(dash.as_bytes(), Reading::RepairMisreading(misreading));
+        assert_eq!(repaired.unwrap().text, "Un \u{2013} doi");
     }
 }

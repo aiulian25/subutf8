@@ -1,10 +1,11 @@
 use std::ffi::OsStr;
 use std::fs::{self, DirEntry};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use crate::constants::{HIDDEN_NAME_PREFIX, SRT_EXTENSION};
-use crate::output_naming::split_srt_name;
+use crate::constants::HIDDEN_NAME_PREFIX;
+use crate::output_naming::split_srt_name_bytes;
 
 /// SAFE-13: the folders the app may read and write, by real location.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,8 +56,6 @@ pub enum SkipReason {
     /// SAFE-13.
     OutsideAllowedArea,
     NotAFolder,
-    /// Linux allows any bytes in names; the app handles only UTF-8 ones.
-    NameNotUtf8,
     Unreadable(io::ErrorKind),
 }
 
@@ -181,22 +180,16 @@ fn check_scanned_file(name: &OsStr, file_type: fs::FileType) -> Result<(), SkipR
     Ok(())
 }
 
+/// NAME-01, in any encoding: a name that is not UTF-8 is read later, with the file (NAME-11).
 fn check_srt_name(name: &OsStr) -> Result<(), SkipReason> {
-    let is_srt = name
-        .to_string_lossy()
-        .to_lowercase()
-        .ends_with(SRT_EXTENSION);
-    if !is_srt {
-        return Err(SkipReason::NotSrt);
-    }
-    let name = name.to_str().ok_or(SkipReason::NameNotUtf8)?;
-    split_srt_name(name).map(drop).ok_or(SkipReason::NotSrt)
+    split_srt_name_bytes(name.as_bytes())
+        .map(drop)
+        .ok_or(SkipReason::NotSrt)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
     use std::process::Command;
 
@@ -349,15 +342,20 @@ mod tests {
         assert_eq!(scan.skipped[0].reason, SkipReason::NotRegularFile);
     }
 
-    /// Linux allows any bytes in names; such names are reported instead of mangled.
+    /// NAME-11: Linux allows any bytes in names; a `.srt` name that is not UTF-8 is listed, and
+    /// read later in the file's own encoding.
     #[test]
-    fn names_that_are_not_utf8_are_reported() {
+    fn names_that_are_not_utf8_are_listed() {
         let root = tempfile::tempdir().unwrap();
-        let name = OsStr::from_bytes(b"Fat\xe3.srt");
-        create(&root.path().join(name));
+        let path = root.path().join(OsStr::from_bytes(b"Fat\xe3.srt"));
+        create(&path);
+        create(&root.path().join(OsStr::from_bytes(b"Not\xe3.txt")));
         let scan = scan_folder(root.path(), false, &whole_system(), NO_LIMIT).unwrap();
-        assert!(scan.files.is_empty());
-        assert_eq!(scan.skipped[0].reason, SkipReason::NameNotUtf8);
+        let real = fs::canonicalize(root.path()).unwrap();
+        let paths: Vec<&Path> = scan.files.iter().map(|file| file.path.as_path()).collect();
+        assert_eq!(paths, [real.join(OsStr::from_bytes(b"Fat\xe3.srt"))]);
+        assert!(scan.skipped.is_empty());
+        assert!(check_chosen_file(&path, &whole_system()).is_ok());
     }
 
     /// LIMIT-03.

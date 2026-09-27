@@ -6,7 +6,6 @@ use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 use subutf8_core::batch::{ConversionJob, Origin};
-use subutf8_core::language::SubtitleLanguage;
 use subutf8_core::report::Outcome;
 
 use crate::clock;
@@ -42,8 +41,11 @@ impl FileStamp {
 #[serde(rename_all = "camelCase")]
 pub struct HistoryRecord {
     pub time: String,
-    /// The original's path, or a dropped file's name.
+    /// The original's path, or a dropped file's name. Paths that are not UTF-8 are kept byte for
+    /// byte (NAME-11), so the watch folders still recognise them (WATCH-03).
+    #[serde(with = "crate::json_path::stored")]
     pub source: PathBuf,
+    #[serde(with = "crate::json_path::stored")]
     pub output: PathBuf,
     pub encoding: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,13 +58,8 @@ pub struct HistoryRecord {
 }
 
 impl HistoryRecord {
-    /// HIST-01: only converted files are recorded.
-    pub fn of(
-        job: &ConversionJob,
-        outcome: &Outcome,
-        language: Option<&SubtitleLanguage>,
-        watched: bool,
-    ) -> Option<Self> {
+    /// HIST-01: only converted files are recorded, with the language each was converted with.
+    pub fn of(job: &ConversionJob, outcome: &Outcome, watched: bool) -> Option<Self> {
         let Outcome::Converted { output, .. } = outcome else {
             return None;
         };
@@ -74,8 +71,11 @@ impl HistoryRecord {
             time: clock::timestamp(),
             source,
             output: output.clone(),
-            encoding: job.encoding.name().to_owned(),
-            language: language.map(|language| language.tag().to_owned()),
+            encoding: job.reading.name(),
+            language: job
+                .language
+                .as_ref()
+                .map(|language| language.tag().to_owned()),
             watched,
             stamp,
         })

@@ -10,12 +10,12 @@ export const UPLOAD_NAME_PARAMETER = "name";
 export const ROUTES = {
   state: "/api/state",
   encodings: "/api/encodings",
+  languages: "/api/languages",
   browse: "/api/browse",
   add: "/api/add",
   upload: "/api/upload",
   files: "/api/files",
   clear: "/api/clear",
-  settings: "/api/settings",
   convert: "/api/convert",
   cancel: "/api/cancel",
   quit: "/api/quit",
@@ -31,7 +31,11 @@ export const ROUTES = {
 
 export const FILE_ACTIONS = {
   preview: "preview",
+  candidates: "candidates",
   encoding: "encoding",
+  language: "language",
+  repair: "repair",
+  output: "output",
   remove: "remove",
 };
 
@@ -44,6 +48,8 @@ export const MODES = { desktop: "desktop", container: "container" };
 export const BROWSE_MODES = { files: "files", folder: "folder" };
 export const PATH_SEPARATOR = "/";
 export const SHORT_PATH_PARTS = 2;
+// NAME-11: a Browse row for a file whose name is not UTF-8 is known by its path's bytes.
+export const BROWSE_RAW_KEY_PREFIX = "hex:";
 
 // Reasons the page itself acts on; the full list is REASON_MESSAGES below.
 export const REASONS = {
@@ -54,6 +60,8 @@ export const REASONS = {
   dataFolderReadOnly: "data-folder-read-only",
   noPrivilegeProgram: "no-privilege-program",
   updateCheckOff: "update-check-off",
+  folderAgrees: "folder-agrees",
+  folderNotWritable: "folder-not-writable",
 };
 
 export const DESTINATIONS = { besideOriginals: "beside-originals", outputFolder: "output-folder" };
@@ -101,25 +109,32 @@ export const STATUS_LABELS = {
 };
 
 // UI-07: what happened and, where there is something to do, what to do next.
-// {offset} is a byte offset and {system} the system's own words.
+// {line} is a line number, {system} the system's own words, {name} a file or folder,
+// {count} and {encoding} what a folder agrees on (ENC-20), and {encoding} and {misreadAs} what
+// garbled text was and how it was read (ENC-22).
 export const REASON_MESSAGES = {
   "too-little-evidence":
     "Too little accented text to detect the encoding. Check the preview, then choose the encoding.",
+  "folder-agrees":
+    "Too little accented text on its own; {count} other files in this folder are {encoding}. Use it if the preview reads correctly.",
   "guess-does-not-decode": "The encoding could not be detected. Choose it by hand.",
   "language-hint-disagrees":
     "The subtitle language points to another encoding. Check the preview, then choose the encoding.",
   "looks-like-utf16":
     "Looks like UTF-16 without a byte-order mark. Check the preview, then confirm the encoding.",
   "damaged-or-mixed-utf8":
-    "Mostly UTF-8 but with invalid bytes, so it is damaged or mixed. Choose an encoding only if the preview reads correctly.",
+    "Part UTF-8, part another encoding. Choose the other encoding; lines that are already UTF-8 are kept.",
+  "looks-garbled":
+    "Looks garbled: {encoding} text that was read as {misreadAs} and saved as UTF-8. Compare the two lines, then choose.",
+  "control-characters-in-utf8":
+    "This UTF-8 file contains control characters that subtitles never use (line {line}), so it cannot be converted.",
   empty: "The file is empty.",
   "not-text": "This is not a text file.",
-  "damaged-utf8": "Damaged UTF-8 at byte {offset}.",
-  "damaged-utf16": "Damaged UTF-16 at byte {offset}.",
-  "does-not-decode":
-    "This encoding does not fit the file (byte {offset}). Choose another encoding.",
+  "damaged-utf8": "Damaged UTF-8 on line {line}.",
+  "damaged-utf16": "Damaged UTF-16 on line {line}.",
+  "does-not-decode": "This encoding does not fit line {line}. Choose another encoding.",
   "round-trip-differs":
-    "Converting back does not give the original bytes (byte {offset}). Choose another encoding.",
+    "Converting back does not give the original bytes on line {line}. Choose another encoding.",
   unreadable: "The file could not be read: {system}.",
   "too-large": "The file is larger than 16 MiB.",
   "not-regular-file": "Not a regular file.",
@@ -127,7 +142,9 @@ export const REASON_MESSAGES = {
   "not-srt": "Not an .srt file.",
   "outside-allowed-area": "Outside the folders SubUTF8 may use.",
   "not-a-folder": "Not a folder.",
-  "name-not-utf8": "The name contains characters SubUTF8 cannot handle.",
+  "invalid-path": "That path cannot be used.",
+  "name-not-decodable":
+    "The file name is in an encoding that does not match the file's, so it was left alone.",
   "already-exists":
     "The output file already exists. Choose Rename or Overwrite to convert it anyway.",
   "name-taken-in-list": "A file higher in the list gets the same output name.",
@@ -151,6 +168,7 @@ export const REASON_MESSAGES = {
   "not-available": "Not available here.",
   internal: "Something went wrong. Try again.",
   "converted-copy": "SubUTF8's converted copy of {name}, so it is left alone.",
+  "not-converted": "The file has not been converted yet.",
   "waiting-in-list": "Added to the list, where it waits for you to check it.",
   "settings-damaged":
     "The saved settings could not be read, so the defaults are shown. Save replaces them.",
@@ -180,12 +198,14 @@ export const REASON_MESSAGES = {
 
 export const WARNING_MESSAGES = {
   "round-trip-differs":
-    "Some characters have two byte forms in this encoding (first at byte {offset}); the text is unaffected.",
+    "Some characters have two byte forms in this encoding (first on line {line}); the text is unaffected.",
   "contains-replacement-characters": "The original already contained replacement characters (�).",
   "no-cues": "No subtitle timings were found.",
-  "missing-cue-number": "Line {line}: a subtitle without a number.",
-  "cue-number-out-of-order": "Line {line}: a subtitle number out of order.",
-  "malformed-timing": "Line {line}: an unusual timing line.",
+  "missing-cue-number": "Line {line}{more}: a subtitle without a number.",
+  "cue-number-out-of-order": "Line {line}{more}: a subtitle number out of order.",
+  "malformed-timing": "Line {line}{more}: an unusual timing line.",
+  "timing-uses-dot":
+    "Line {line}{more}: timings use '.' before the milliseconds; most players accept it.",
 };
 
 export const TEXT = {
@@ -196,15 +216,34 @@ export const TEXT = {
   selectFile: "Select a file to see its text.",
   nothingToPreview: "Nothing to preview.",
   clipped: "(cut at 400 characters)",
+  brokenLine: "Line {line}, as far as it can be read:",
+  moreLines: " and {count} more",
+  suggestionsTitle: "Suggestions — pick the one that reads correctly:",
+  suggestionLabel: "{encoding} — {sample}",
   writtenTo: "Written to {path}",
   encodingLabel: "Encoding",
   useEncoding: "Use this encoding",
+  keepUtf8Lines: "Keep lines that are already UTF-8",
+  useForAllAgreeing: "Use {encoding} for the {count} files like this",
+  repairAsIs: "As it is: {sample}",
+  repairRepaired: "Repaired: {sample}",
+  repair: "Repair",
+  keepAsIs: "Keep as it is",
+  repairSelected: "Repair the {count} selected files",
+  keepSelected: "Keep the {count} selected files as they are",
+  repairRefused: "{count} selected files were left as they were. First: {name}: {reason}",
   uploading: "Adding dropped files: {current} of {total}",
   converting: "Converting {finished} of {total}",
   notSrtDropped: "Not .srt files, so skipped: {count}.",
   dropUnreadable: "The dropped files could not be read. Try again, or use Browse.",
   addSkipped: "{count} could not be added. First: {path}: {reason}",
   limitReached: "The list is full, so some files were not added.",
+  download: "Download",
+  helpsDetection: "helps detection",
+  nameOnly: "name only",
+  downloadAll: "Download all converted ({count})",
+  writeSkippedToOutputFolder: "Write the {count} skipped files to {folder}",
+  writeSkippedFileToOutputFolder: "Write the skipped file to {folder}",
   nothingAdded: "Nothing new was added.",
   summaryParts: {
     ready: "{count} ready",
@@ -231,6 +270,11 @@ export const TEXT = {
   dropHintWindow: "Dropped files and folders are converted where they are.",
   encodingForSelected: "Encoding for the {count} selected files",
   encodingRefused: "{count} selected files kept their encoding. First: {name}: {reason}",
+  languageRefused: "{count} selected files kept their language. First: {name}: {reason}",
+  fileLanguage: "Subtitle language for this file",
+  fileLanguageForSelected: "Subtitle language for the {count} selected files",
+  languageFromSettings: "{language}, as in Settings",
+  noLanguage: "none",
   useThisFolder: "Use this folder",
   emptyFolder: "No folders or .srt files here.",
   truncatedFolder: "Only the first 5,000 entries are shown.",
@@ -242,7 +286,7 @@ export const SETTINGS_TEXT = {
   restored: "The defaults are back.",
   dockerDataHint: "Mount a folder at /data, as docker-compose.yml shows.",
   watchExplanation:
-    "New subtitles in these folders are converted with the defaults above, once they have stopped changing. Existing files are never replaced.",
+    "New subtitles in these folders are converted with the settings above, once they have stopped changing. Existing files are never replaced.",
   watchEmpty: "No folders are watched.",
   watchInterval: "Looks every {seconds} seconds.",
   watchUnavailable: "Not available now: {folders}.",
@@ -252,12 +296,25 @@ export const SETTINGS_TEXT = {
   listSeparator: ", ",
 };
 
+// The desktop window opens only SubUTF8's own GitHub pages, in the system's browser.
+export const RELEASES_PAGE = "https://github.com/aiulian25/subutf8/releases";
+
+// UPDATE-01 to UPDATE-05: the Settings card, as CineSort shows it.
 export const UPDATE_TEXT = {
-  available: "SubUTF8 {latest} is available. You have {current}.",
-  upToDate: "SubUTF8 {current} is up to date.",
-  notChecked: "You have SubUTF8 {current}.",
-  checkFailed: "GitHub could not be reached. You have SubUTF8 {current}.",
+  upToDate: "✓ Up to date",
+  couldNotCheck: "Couldn't check",
+  notChecked: "Not checked yet",
+  newChip: "New",
+  version: "SubUTF8 v{current}",
+  automaticCheck: "automatic check once per day",
+  automaticCheckOff: "automatic check off",
   checkNow: "Check for updates",
+  checking: "Checking…",
+  checkedLatest: "Checked just now — you're on the latest version.",
+  checkFailed: "Couldn't reach GitHub — check your connection and try again.",
+  releases: "Releases on GitHub",
+  available: "SubUTF8 v{latest} is available",
+  currentVersion: "You're on v{current} · ",
   download: "Download update",
   downloading: "Downloading: {percent}%",
   downloaded: "Downloaded and checked: {path}",
@@ -273,7 +330,21 @@ export const UPDATE_TEXT = {
   releaseNotes: "What's new",
   installYourselfDeb: "Install it yourself with: sudo apt install {path}",
   installYourselfRpm: "Install it yourself with: sudo dnf install {path}",
-  banner: "SubUTF8 {latest} is available.",
+  readyTitle: "SubUTF8 v{latest} is ready to install",
+  readyChecked: "Downloaded, and its SHA-256 matches the GitHub release.",
+  readyPackage:
+    "Installing asks for your password in the system's own dialog; SubUTF8 itself never runs as root.",
+  readyAppImage: "The AppImage is replaced in place, so no password is needed.",
+  untouched: "Your files, history and settings are untouched.",
+  later: "Later",
+  installingTitle: "Installing SubUTF8 v{latest}…",
+  hide: "Hide",
+  installedTitle: "SubUTF8 v{latest} is installed",
+  restartBody: "Restart SubUTF8 to start using it.",
+  restartLater: "Restart later",
+  manualTitle: "Install SubUTF8 v{latest} yourself",
+  close: "Close",
+  banner: "SubUTF8 v{latest} is available.",
   bannerOpen: "Update…",
   bannerOpenDocker: "How to update",
   bannerDismiss: "Hide this message",
@@ -343,7 +414,7 @@ export const SETTING_ENTRIES = [
   {
     label: "Check for updates",
     words: "update version upgrade release new",
-    target: "default-update-check",
+    target: "update-card",
   },
   { label: "Restore defaults", words: "reset restore defaults", target: "settings-restore" },
 ];
@@ -359,41 +430,19 @@ export const COLLISION_OPTIONS = [
   ["overwrite", "Overwrite"],
 ];
 
-// ENC-13: Romanian first, then common subtitle languages.
-export const LANGUAGE_SUGGESTIONS = [
-  "ro",
-  "en",
-  "fr",
-  "de",
-  "es",
-  "it",
-  "pt",
-  "pt-BR",
-  "nl",
-  "hu",
-  "pl",
-  "cs",
-  "sk",
-  "sl",
-  "hr",
-  "sr",
-  "bs",
-  "bg",
-  "mk",
-  "ru",
-  "uk",
-  "el",
-  "tr",
-  "ar",
-  "he",
-  "fa",
-  "ja",
-  "ko",
-  "zh",
-  "zh-TW",
-  "th",
-  "vi",
+// ENC-23: Romanian subtitles, `ro` with or without a region, can take the comma letters that
+// windows-1250 and ISO-8859-2 lack.
+export const ROMANIAN_LANGUAGE = "ro";
+export const LANGUAGE_SUBTAG_SEPARATOR = "-";
+export const ROMANIAN_LETTERS = { asDecoded: "as-decoded", comma: "comma" };
+export const ROMANIAN_LETTER_OPTIONS = [
+  [ROMANIAN_LETTERS.asDecoded, "ş ţ (as decoded)"],
+  [ROMANIAN_LETTERS.comma, "ș ț (correct)"],
 ];
+
+// UI-19: common subtitle languages that only name outputs; the ones that help detection
+// (ENC-13) come from the app.
+export const NAME_ONLY_LANGUAGES = ["en", "fr", "de", "es", "it", "pt", "pt-BR", "nl"];
 
 export const SRT_EXTENSION = ".srt";
 
@@ -420,4 +469,7 @@ export const KEYS = {
 export const HIDDEN_NAME_PREFIX = ".";
 export const IDLE_POLL_MILLISECONDS = 30000;
 export const BUSY_POLL_MILLISECONDS = 300;
+// UI-17: how long a downloaded file's temporary address lives; browsers start saving it within
+// this time, and some do only after the click that asked for it has finished.
+export const DOWNLOAD_ADDRESS_LIFETIME_MILLISECONDS = 60000;
 export const PLACEHOLDER_PATTERN = /\{(\w+)\}/g;

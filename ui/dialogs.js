@@ -1,10 +1,16 @@
 import {
   COLLISION_OPTIONS,
   DESTINATION_OPTIONS,
+  LANGUAGE_SUBTAG_SEPARATOR,
   MODES,
+  NAME_ONLY_LANGUAGES,
   PACKAGES,
   PERCENT,
   REASONS,
+  RELEASES_PAGE,
+  ROMANIAN_LANGUAGE,
+  ROMANIAN_LETTER_OPTIONS,
+  ROMANIAN_LETTERS,
   SEARCH_TEXT,
   SETTINGS_TEXT,
   SHOWN_TIME_LENGTH,
@@ -28,6 +34,10 @@ export const dialogElements = {
   settingsDialog: document.getElementById("settings-dialog"),
   settingsNotice: document.getElementById("settings-notice"),
   defaultLanguage: document.getElementById("default-language"),
+  languageHint: document.getElementById("language-hint"),
+  languageList: document.getElementById("language-list"),
+  romanianLettersSetting: document.getElementById("romanian-letters-setting"),
+  defaultRomanianLetters: document.getElementById("default-romanian-letters"),
   defaultDestination: document.getElementById("default-destination"),
   defaultOutputFolder: document.getElementById("default-output-folder"),
   defaultOutputFolderButton: document.getElementById("default-output-folder-button"),
@@ -42,6 +52,12 @@ export const dialogElements = {
   watchLog: document.getElementById("watch-log"),
   updateCard: document.getElementById("update-card"),
   defaultUpdateCheck: document.getElementById("default-update-check"),
+  updatePrompt: document.getElementById("update-prompt"),
+  updatePromptTitle: document.getElementById("update-prompt-title"),
+  updatePromptBody: document.getElementById("update-prompt-body"),
+  updatePromptMessage: document.getElementById("update-prompt-message"),
+  updatePromptLater: document.getElementById("update-prompt-later"),
+  updatePromptAct: document.getElementById("update-prompt-act"),
   settingsDialogMessage: document.getElementById("settings-dialog-message"),
   settingsRestore: document.getElementById("settings-restore"),
   settingsCancel: document.getElementById("settings-cancel"),
@@ -60,15 +76,55 @@ export const UPDATE_ACTIONS = {
 };
 
 export function setUpDialogs() {
-  const { defaultDestination, defaultCollision, defaultTheme, updateBannerDismiss } =
-    dialogElements;
+  const {
+    defaultDestination,
+    defaultCollision,
+    defaultTheme,
+    defaultRomanianLetters,
+    updateBannerDismiss,
+  } = dialogElements;
   fillSelect(defaultDestination, DESTINATION_OPTIONS);
   fillSelect(defaultCollision, COLLISION_OPTIONS);
   fillSelect(defaultTheme, THEME_OPTIONS);
+  fillSelect(defaultRomanianLetters, ROMANIAN_LETTER_OPTIONS);
   dialogElements.watchExplanation.textContent = SETTINGS_TEXT.watchExplanation;
   updateBannerDismiss.textContent = UPDATE_TEXT.bannerDismissSymbol;
   updateBannerDismiss.title = UPDATE_TEXT.bannerDismiss;
   updateBannerDismiss.setAttribute("aria-label", UPDATE_TEXT.bannerDismiss);
+}
+
+// UI-19: the languages the app hints detection with (ENC-13), in its lower-case form.
+const hintedLanguages = new Set();
+
+// UI-19: the suggestions for every subtitle language field: the languages that help
+// detection, as the app lists them, then common ones that only name outputs.
+export function setUpLanguageList(hinted) {
+  for (const tag of hinted) {
+    hintedLanguages.add(tag.toLowerCase());
+  }
+  const suggestions = [
+    ...hinted.map((tag) => [tag, TEXT.helpsDetection]),
+    ...NAME_ONLY_LANGUAGES.map((tag) => [tag, TEXT.nameOnly]),
+  ];
+  dialogElements.languageList.replaceChildren(
+    ...suggestions.map(([tag, label]) => {
+      const option = create("option");
+      option.value = tag;
+      option.label = label;
+      return option;
+    }),
+  );
+}
+
+// UI-19 and ENC-13: as the app decides, a tag helps detection when it, or its language without
+// the region, is one the app hints with.
+function languageHint(tag) {
+  if (!tag) {
+    return "";
+  }
+  const [language] = tag.split(LANGUAGE_SUBTAG_SEPARATOR);
+  const helps = [tag, language].some((part) => hintedLanguages.has(part.toLowerCase()));
+  return helps ? TEXT.helpsDetection : TEXT.nameOnly;
 }
 
 // UI-13: "system" follows the desktop's setting through the stylesheet.
@@ -86,6 +142,11 @@ export function renderDraft(draft, app) {
   if (document.activeElement !== elements.defaultLanguage) {
     elements.defaultLanguage.value = draft.language ?? "";
   }
+  elements.languageHint.textContent = languageHint(draft.language);
+  elements.romanianLettersSetting.hidden = !isRomanianLanguage(draft.language);
+  elements.defaultRomanianLetters.value = draft.romanianCommaLetters
+    ? ROMANIAN_LETTERS.comma
+    : ROMANIAN_LETTERS.asDecoded;
   elements.defaultDestination.value = draft.destination;
   elements.defaultOutputFolder.textContent = shortPath(draft.outputFolder);
   elements.defaultOutputFolder.title = draft.outputFolder;
@@ -97,6 +158,12 @@ export function renderDraft(draft, app) {
   elements.watchSection.hidden = app.mode !== MODES.container;
   renderWatchFolders(draft.watchFolders);
   renderDataProblem(app);
+}
+
+// ENC-23: `ro`, with or without a region such as `ro-MD`, in any letter case.
+function isRomanianLanguage(tag) {
+  const [language] = (tag ?? "").split(LANGUAGE_SUBTAG_SEPARATOR);
+  return language.toLowerCase() === ROMANIAN_LANGUAGE;
 }
 
 function renderWatchFolders(folders) {
@@ -174,14 +241,70 @@ function actionButton(label, action, isPrimary) {
   return button;
 }
 
-function statusLine(update) {
-  if (update.latest) {
-    return fill(UPDATE_TEXT.available, update);
-  }
+// A new tab in a browser; the desktop window hands SubUTF8's GitHub pages to the system's
+// browser.
+function releaseLink(address, label) {
+  const link = create("a", "update-link", label);
+  link.href = address;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  return link;
+}
+
+function statusChip(update) {
   if (update.checkFailed) {
-    return fill(UPDATE_TEXT.checkFailed, update);
+    return create("span", "update-chip is-warning", UPDATE_TEXT.couldNotCheck);
   }
-  return fill(update.checked ? UPDATE_TEXT.upToDate : UPDATE_TEXT.notChecked, update);
+  if (update.checked) {
+    return create("span", "update-chip is-ok", UPDATE_TEXT.upToDate);
+  }
+  return create("span", "update-chip", UPDATE_TEXT.notChecked);
+}
+
+function scheduleText(update, isAutomatic) {
+  if (!update.allowed) {
+    return problemText({ reason: REASONS.updateCheckOff });
+  }
+  return isAutomatic ? UPDATE_TEXT.automaticCheck : UPDATE_TEXT.automaticCheckOff;
+}
+
+// As in CineSort: the state, the version, the daily check, Check for updates and the releases.
+function currentVersionRow(update, isAutomatic, check) {
+  const row = create("div", "update-row");
+  if (update.allowed) {
+    row.append(statusChip(update));
+  }
+  row.append(
+    create("span", "update-version", fill(UPDATE_TEXT.version, update)),
+    create("span", "update-note update-spacer", scheduleText(update, isAutomatic)),
+  );
+  if (update.allowed) {
+    const label = check.isChecking ? UPDATE_TEXT.checking : UPDATE_TEXT.checkNow;
+    const button = actionButton(label, UPDATE_ACTIONS.check, false);
+    button.disabled = check.isChecking;
+    row.append(button);
+  }
+  row.append(releaseLink(RELEASES_PAGE, UPDATE_TEXT.releases));
+  return row;
+}
+
+// UPDATE-01: what a check someone asked for found.
+function checkNote(check) {
+  if (!check.note) {
+    return [];
+  }
+  return [create("p", check.isWarning ? "update-note is-warning" : "update-note", check.note)];
+}
+
+function newVersionHeading(update) {
+  const heading = create("div", "update-row");
+  heading.append(
+    create("span", "update-chip is-new", UPDATE_TEXT.newChip),
+    create("span", "update-version", fill(UPDATE_TEXT.available, update)),
+  );
+  const detail = create("p", "update-note", fill(UPDATE_TEXT.currentVersion, update));
+  detail.append(releaseLink(update.releasePage ?? RELEASES_PAGE, UPDATE_TEXT.releaseNotes));
+  return [heading, detail];
 }
 
 // UPDATE-04: what installing by hand takes when there is no pkexec.
@@ -242,32 +365,78 @@ function idleStep(update, isAppImage) {
   return [create("p", "", UPDATE_TEXT.getFromGithub)];
 }
 
-// UPDATE-01 to UPDATE-05. The release notes open in a browser tab only: the desktop window
-// never opens other sites.
-export function renderUpdateCard(update, windowOpen) {
-  const parts = [];
-  if (!update.allowed) {
-    parts.push(create("p", "muted", problemText({ reason: REASONS.updateCheckOff })));
-    dialogElements.updateCard.replaceChildren(...parts);
+// UPDATE-01 to UPDATE-05, as CineSort shows them. `check` is the Check for updates button's
+// state and what it found.
+export function renderUpdateCard(update, isAutomatic, check) {
+  const card = dialogElements.updateCard;
+  const isNew = update.allowed && Boolean(update.latest);
+  card.classList.toggle("is-new", isNew);
+  if (!isNew) {
+    card.replaceChildren(currentVersionRow(update, isAutomatic, check), ...checkNote(check));
     return;
   }
-  parts.push(create("p", "", statusLine(update)));
-  if (update.releasePage && !windowOpen) {
-    const link = create("a", "", UPDATE_TEXT.releaseNotes);
-    link.href = update.releasePage;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    parts.push(link);
+  const problem = update.problem ? [create("p", "problem", problemText(update.problem))] : [];
+  card.replaceChildren(...newVersionHeading(update), ...problem, ...nextStep(update));
+}
+
+// What the prompt after a download says and offers at each step.
+function promptStep(update) {
+  const isAppImage = update.package === PACKAGES.appimage;
+  if (update.step === UPDATE_STEPS.installing) {
+    return {
+      title: fill(UPDATE_TEXT.installingTitle, update),
+      lines: [isAppImage ? UPDATE_TEXT.replacing : UPDATE_TEXT.installing],
+      later: UPDATE_TEXT.hide,
+    };
   }
-  if (update.problem) {
-    parts.push(create("p", "problem", problemText(update.problem)));
+  if (update.step === UPDATE_STEPS.installed) {
+    return {
+      title: fill(UPDATE_TEXT.installedTitle, update),
+      lines: [UPDATE_TEXT.restartBody, UPDATE_TEXT.untouched],
+      action: UPDATE_ACTIONS.restart,
+      actionLabel: UPDATE_TEXT.restart,
+      later: UPDATE_TEXT.restartLater,
+    };
   }
-  parts.push(...nextStep(update));
-  const isBusy = [UPDATE_STEPS.downloading, UPDATE_STEPS.installing, UPDATE_STEPS.installed];
-  if (!isBusy.includes(update.step)) {
-    parts.push(actionButton(UPDATE_TEXT.checkNow, UPDATE_ACTIONS.check, false));
+  if (update.problem?.reason === REASONS.noPrivilegeProgram) {
+    return {
+      title: fill(UPDATE_TEXT.manualTitle, update),
+      lines: [installYourself(update)],
+      later: UPDATE_TEXT.close,
+    };
   }
-  dialogElements.updateCard.replaceChildren(...parts);
+  return {
+    title: fill(UPDATE_TEXT.readyTitle, update),
+    lines: [
+      UPDATE_TEXT.readyChecked,
+      isAppImage ? UPDATE_TEXT.readyAppImage : UPDATE_TEXT.readyPackage,
+      UPDATE_TEXT.untouched,
+    ],
+    problem: update.problem ? problemText(update.problem) : "",
+    action: UPDATE_ACTIONS.install,
+    actionLabel: isAppImage ? UPDATE_TEXT.replaceAppImage : UPDATE_TEXT.install,
+    later: UPDATE_TEXT.later,
+  };
+}
+
+// UPDATE-04 and UPDATE-05: after a download, the page asks to install it and then to restart,
+// as CineSort's prompt does.
+export function renderUpdatePrompt(update) {
+  const step = promptStep(update);
+  const elements = dialogElements;
+  elements.updatePromptTitle.textContent = step.title;
+  const lines = step.lines.map((line) => create("p", "", line));
+  const problem = step.problem ? [create("p", "problem", step.problem)] : [];
+  elements.updatePromptBody.replaceChildren(...lines, ...problem);
+  elements.updatePromptLater.textContent = step.later;
+  elements.updatePromptAct.hidden = !step.action;
+  elements.updatePromptAct.textContent = step.actionLabel ?? "";
+  elements.updatePromptAct.dataset.updateAction = step.action ?? "";
+}
+
+export function renderUpdatePromptMessage(message) {
+  dialogElements.updatePromptMessage.textContent = message;
+  dialogElements.updatePromptMessage.hidden = !message;
 }
 
 export function renderUpdateBanner(update, isDismissed) {

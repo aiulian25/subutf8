@@ -16,15 +16,16 @@ use tokio::sync::watch;
 use crate::access::{host_is_allowed, request_is_allowed};
 use crate::api;
 use crate::constants::{
-    ADD_ROUTE, API_PREFIX, ASSETS, BROWSE_ROUTE, CANCEL_ROUTE, CLEAR_ROUTE,
+    ADD_ROUTE, API_PREFIX, ASSETS, BROWSE_ROUTE, CANCEL_ROUTE, CANDIDATES_ROUTE, CLEAR_ROUTE,
     CONTAINER_FOLDERS_MESSAGE, CONTAINER_RUNNING_MESSAGE, CONTENT_SECURITY_POLICY, CONVERT_ROUTE,
     DATA_FOLDER_READ_ONLY_MESSAGE, DEFAULTS_ROUTE, DENY_FRAMING, ENCODING_ROUTE, ENCODINGS_ROUTE,
-    HISTORY_ROUTE, IDLE_CHECK_INTERVAL, IDLE_LIMIT, INDEX_PATH, LOOPBACK_HOST,
-    MAXIMUM_UPLOAD_BYTES, NO_FOLDERS_MESSAGE, NO_REFERRER, NO_SNIFF, NO_STORE, OPEN_ROUTE,
-    OUTPUT_FOLDER_READ_ONLY_MESSAGE, PREVIEW_ROUTE, QUIT_ROUTE, REMOVE_ROUTE,
-    RESTORE_DEFAULTS_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, THEME_ATTRIBUTE, THEME_PLACEHOLDER,
-    TOKEN_FRAGMENT, TOKEN_HEADER, UPDATE_CHECK_INTERVAL, UPDATE_CHECK_ROUTE, UPDATE_DOWNLOAD_ROUTE,
-    UPDATE_INSTALL_ROUTE, UPDATE_RESTART_ROUTE, UPLOAD_ROUTE, WATCH_LOG_ROUTE,
+    HISTORY_ROUTE, IDLE_CHECK_INTERVAL, IDLE_LIMIT, INDEX_PATH, LANGUAGE_ROUTE, LANGUAGES_ROUTE,
+    LOOPBACK_HOST, MAXIMUM_UPLOAD_BYTES, NO_FOLDERS_MESSAGE, NO_REFERRER, NO_SNIFF, NO_STORE,
+    OPEN_ROUTE, OUTPUT_FOLDER_READ_ONLY_MESSAGE, OUTPUT_ROUTE, PREVIEW_ROUTE, QUIT_ROUTE,
+    REMOVE_ROUTE, REPAIR_ROUTE, RESTORE_DEFAULTS_ROUTE, STATE_ROUTE, THEME_ATTRIBUTE,
+    THEME_PLACEHOLDER, TOKEN_FRAGMENT, TOKEN_HEADER, UPDATE_CHECK_INTERVAL, UPDATE_CHECK_ROUTE,
+    UPDATE_DOWNLOAD_ROUTE, UPDATE_INSTALL_ROUTE, UPDATE_RESTART_ROUTE, UPLOAD_ROUTE,
+    WATCH_LOG_ROUTE,
 };
 use crate::defaults::{Defaults, DefaultsStore};
 use crate::history::History;
@@ -116,6 +117,7 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route(STATE_ROUTE, get(api::state))
         .route(ENCODINGS_ROUTE, get(api::encodings))
+        .route(LANGUAGES_ROUTE, get(api::languages))
         .route(BROWSE_ROUTE, post(api::browse))
         .route(ADD_ROUTE, post(api::add))
         .route(OPEN_ROUTE, post(api::open))
@@ -124,10 +126,13 @@ pub fn router(state: AppState) -> Router {
             post(api::upload).layer(DefaultBodyLimit::max(MAXIMUM_UPLOAD_BYTES)),
         )
         .route(PREVIEW_ROUTE, get(api::preview))
+        .route(CANDIDATES_ROUTE, get(api::candidates))
         .route(ENCODING_ROUTE, post(api::choose_encoding))
+        .route(LANGUAGE_ROUTE, post(api::set_file_language))
+        .route(REPAIR_ROUTE, post(api::repair))
+        .route(OUTPUT_ROUTE, get(api::output))
         .route(REMOVE_ROUTE, post(api::remove))
         .route(CLEAR_ROUTE, post(api::clear))
-        .route(SETTINGS_ROUTE, post(api::change_settings))
         .route(CONVERT_ROUTE, post(api::convert))
         .route(CANCEL_ROUTE, post(api::cancel))
         .route(QUIT_ROUTE, post(api::quit))

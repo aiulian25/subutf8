@@ -6,15 +6,17 @@
 //! The page asks for the system's own file picker by posting `files`, `folders` or
 //! `output-folder`; the chosen paths go back to the page's `subutf8Picked` function. Files
 //! dropped onto the window go there too, as `dropped`, because WebKitGTK does not tell the page
-//! where dropped files are.
+//! where dropped files are. Links to SubUTF8's own GitHub pages open in the system's browser.
 
 use std::env;
 use std::io::{self, BufRead};
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 
 use gtk::prelude::{FileChooserExt, NativeDialogExt};
+use serde_json::{Map, Value};
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
@@ -43,6 +45,8 @@ const PICK_FOLDERS: &str = "folders";
 const PICK_OUTPUT_FOLDER: &str = "output-folder";
 const DROPPED: &str = "dropped";
 const PICKED_CALLBACK: &str = "subutf8Picked";
+/// NAME-11: a path that is not UTF-8 goes to the page as `{"hex": "…"}`, which the app reads.
+const HEX_KEY: &str = "hex";
 const FILES_TITLE: &str = "Add subtitle files";
 const FOLDERS_TITLE: &str = "Add folders";
 const OUTPUT_FOLDER_TITLE: &str = "Choose the output folder";
@@ -51,6 +55,8 @@ const SELECT_LABEL: &str = "_Select";
 const CANCEL_LABEL: &str = "_Cancel";
 const SUBTITLES_FILTER_NAME: &str = "Subtitles (.srt)";
 const SUBTITLES_PATTERN: &str = "*.[sS][rR][tT]";
+/// SAFE-16: the only other pages the window lets through, and only to the system's browser.
+const PROJECT_PAGES: &str = "https://github.com/aiulian25/subutf8/";
 
 #[derive(Debug, Clone, Copy)]
 enum Pick {
@@ -84,6 +90,7 @@ enum Command {
     Close,
     Pick(Pick),
     Dropped(Vec<PathBuf>),
+    OpenInBrowser(String),
 }
 
 fn main() -> ExitCode {
@@ -114,11 +121,17 @@ fn open(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let origin = origin_of(url).to_owned();
     let picker = event_loop.create_proxy();
     let dropper = event_loop.create_proxy();
+    let opener = event_loop.create_proxy();
     let webview = WebViewBuilder::new()
         .with_url(url)
         .with_incognito(true)
         .with_navigation_handler(move |target| target.starts_with(&origin))
-        .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+        .with_new_window_req_handler(move |target, _| {
+            if is_project_page(&target) {
+                let _ = opener.send_event(Command::OpenInBrowser(target));
+            }
+            NewWindowResponse::Deny
+        })
         .with_download_started_handler(|_, _| false)
         .with_ipc_handler(move |request| {
             if let Some(pick) = Pick::from_message(request.body()) {
@@ -150,6 +163,11 @@ fn open(url: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
             Event::UserEvent(Command::Dropped(paths)) => {
                 let _ = webview.evaluate_script(&picked_script(DROPPED, &paths));
+            }
+            // Through the desktop portal where there is one, like the file picker.
+            Event::UserEvent(Command::OpenInBrowser(link)) => {
+                let time = gtk::current_event_time();
+                let _ = gtk::show_uri_on_window(Some(window.gtk_window()), &link, time);
             }
             _ => {}
         }
@@ -195,10 +213,32 @@ fn choose(window: &Window, pick: Pick) -> Vec<PathBuf> {
 }
 
 fn picked_script(kind: &str, paths: &[PathBuf]) -> String {
-    let texts: Vec<&str> = paths.iter().filter_map(|path| path.to_str()).collect();
-    let paths = serde_json::to_string(&texts).unwrap_or_default();
+    let values: Vec<Value> = paths.iter().map(|path| picked_value(path)).collect();
+    let paths = serde_json::to_string(&values).unwrap_or_default();
     let kind = serde_json::to_string(kind).unwrap_or_default();
     format!("window.{PICKED_CALLBACK}?.({kind}, {paths});")
+}
+
+/// A path as the app takes it: a string, or its bytes when its name is not UTF-8 (NAME-11).
+fn picked_value(path: &Path) -> Value {
+    if let Some(text) = path.to_str() {
+        return Value::from(text);
+    }
+    let mut bytes = Map::new();
+    bytes.insert(
+        HEX_KEY.to_owned(),
+        Value::from(hex_of(path.as_os_str().as_bytes())),
+    );
+    Value::Object(bytes)
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// WebKit resolves a link before asking, so `..` and similar cannot leave the project's pages.
+fn is_project_page(link: &str) -> bool {
+    link.starts_with(PROJECT_PAGES)
 }
 
 /// `http://127.0.0.1:40123/#token=…` becomes `http://127.0.0.1:40123/`.
@@ -231,6 +271,8 @@ fn listen_to_subutf8(proxy: EventLoopProxy<Command>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn origin_keeps_scheme_host_and_port_only() {
@@ -241,16 +283,39 @@ mod tests {
         assert_eq!(origin_of("http://localhost:1"), "http://localhost:1");
     }
 
-    /// Paths reach the page as JSON, so quotes and other characters cannot break the script.
+    /// SAFE-16.
+    #[test]
+    fn only_project_pages_open_in_the_browser() {
+        for link in [
+            "https://github.com/aiulian25/subutf8/releases",
+            "https://github.com/aiulian25/subutf8/releases/tag/v1.2.0",
+        ] {
+            assert!(is_project_page(link), "{link}");
+        }
+        for link in [
+            "https://github.com/aiulian25/subutf8",
+            "https://github.com/aiulian25/other/releases",
+            "https://github.com.example/aiulian25/subutf8/releases",
+            "http://github.com/aiulian25/subutf8/releases",
+            "file:///etc/passwd",
+            "http://127.0.0.1:61880/",
+        ] {
+            assert!(!is_project_page(link), "{link}");
+        }
+    }
+
+    /// Paths reach the page as JSON, so quotes and other characters cannot break the script,
+    /// and a name that is not UTF-8 travels by its bytes (NAME-11).
     #[test]
     fn picked_paths_are_passed_as_json() {
         let paths = [
             PathBuf::from("/tmp/a \"b\".srt"),
             PathBuf::from("/tmp/c\\d"),
+            PathBuf::from(OsString::from_vec(b"/tmp/Fat\xe3.srt".to_vec())),
         ];
         assert_eq!(
             picked_script(Pick::Files.message(), &paths),
-            r#"window.subutf8Picked?.("files", ["/tmp/a \"b\".srt","/tmp/c\\d"]);"#
+            r#"window.subutf8Picked?.("files", ["/tmp/a \"b\".srt","/tmp/c\\d",{"hex":"2f746d702f466174e32e737274"}]);"#
         );
     }
 }

@@ -15,6 +15,7 @@ use crate::constants::{
     PRIVATE_FILE_PERMISSIONS, PRIVATE_FOLDER_PERMISSIONS, RUNTIME_FOLDER_NAME,
     RUNTIME_FOLDER_VARIABLE, SUCCESS_STATUS_PREFIX, TOKEN_HEADER,
 };
+use crate::json_path::JsonPath;
 
 /// ACCESS-08: where the running app writes its address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,9 +24,10 @@ struct InstanceRecord {
     token: String,
 }
 
+/// NAME-11: "Open with" passes names in any encoding.
 #[derive(Serialize)]
-struct OpenRequest<'paths> {
-    paths: Vec<&'paths str>,
+struct OpenRequest {
+    paths: Vec<JsonPath>,
 }
 
 fn instance_file() -> Option<PathBuf> {
@@ -43,7 +45,7 @@ pub async fn hand_over(files: &[PathBuf]) -> bool {
     let Some(record) = instance_file().and_then(|path| read_record(&path)) else {
         return false;
     };
-    let paths = files.iter().filter_map(|path| path.to_str()).collect();
+    let paths = files.iter().map(|path| JsonPath::of(path)).collect();
     let Ok(body) = serde_json::to_string(&OpenRequest { paths }) else {
         return false;
     };

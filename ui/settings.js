@@ -1,5 +1,5 @@
 import { api } from "./api.js";
-import { MODES, SETTINGS_TEXT } from "./constants.js";
+import { MODES, ROMANIAN_LETTERS, SETTINGS_TEXT, UPDATE_STEPS, UPDATE_TEXT } from "./constants.js";
 import {
   UPDATE_ACTIONS,
   applyTheme,
@@ -7,16 +7,22 @@ import {
   renderDraft,
   renderSettingsMessage,
   renderUpdateCard,
+  renderUpdatePrompt,
+  renderUpdatePromptMessage,
   renderWatchLog,
 } from "./dialogs.js";
 
 // SET-01: the Settings dialog edits a copy of the saved defaults, and Save sends them together.
-// The update card acts at once, as in CineSort.
+// The update card and the prompt after a download act at once, as in CineSort.
 
-const settings = { context: null, draft: null };
+const NO_CHECK = { isChecking: false, note: "", isWarning: false };
+
+// UPDATE-04: the steps that open the prompt by themselves, once each per download.
+const PROMPTING_STEPS = [UPDATE_STEPS.idle, UPDATE_STEPS.installed];
+
+const settings = { context: null, draft: null, check: NO_CHECK, promptKey: null };
 
 const UPDATE_CALLS = {
-  [UPDATE_ACTIONS.check]: api.checkForUpdate,
   [UPDATE_ACTIONS.download]: api.downloadUpdate,
   [UPDATE_ACTIONS.install]: api.installUpdate,
   [UPDATE_ACTIONS.restart]: api.restartAfterUpdate,
@@ -51,6 +57,7 @@ export async function openSettings(focusTargetId) {
   }
   if (!isSettingsOpen()) {
     settings.draft = copyOf(app.defaults);
+    settings.check = NO_CHECK;
     renderSettingsMessage("");
     render();
     elements.settingsDialog.showModal();
@@ -74,7 +81,31 @@ export function refreshSettings() {
 function render() {
   const app = currentApp();
   renderDraft(settings.draft, app);
-  renderUpdateCard(app.update, app.windowOpen);
+  renderUpdateCard(app.update, app.defaults.updateCheck, settings.check);
+}
+
+// UPDATE-04 and UPDATE-05: once a download is checked, the page asks whether to install it, and
+// once it is installed, whether to restart, also when Settings is closed. Later closes the
+// prompt; the Settings card keeps the same steps.
+export function refreshUpdatePrompt() {
+  const { update } = currentApp();
+  const { updatePrompt, updatePromptAct } = elements;
+  const isPromptingStep = Boolean(update.downloaded) && PROMPTING_STEPS.includes(update.step);
+  const key = isPromptingStep ? JSON.stringify([update.downloaded, update.step]) : null;
+  const isNewStep = key !== null && key !== settings.promptKey;
+  if (!isNewStep && !updatePrompt.open) {
+    return;
+  }
+  renderUpdatePrompt(update);
+  if (!isNewStep) {
+    return;
+  }
+  settings.promptKey = key;
+  if (!updatePrompt.open) {
+    renderUpdatePromptMessage("");
+    updatePrompt.showModal();
+  }
+  updatePromptAct.focus();
 }
 
 async function refreshWatchLog() {
@@ -101,13 +132,22 @@ function bindDraftControls() {
     [elements.defaultByDay, "organiseByDay", () => elements.defaultByDay.checked],
     [elements.defaultCollision, "collisionPolicy", () => elements.defaultCollision.value],
     [elements.defaultUpdateCheck, "updateCheck", () => elements.defaultUpdateCheck.checked],
-    [elements.defaultLanguage, "language", languageValue],
+    [
+      elements.defaultRomanianLetters,
+      "romanianCommaLetters",
+      () => elements.defaultRomanianLetters.value === ROMANIAN_LETTERS.comma,
+    ],
   ];
   for (const [control, field, value] of bindings) {
     control.addEventListener("change", () => {
       settings.draft[field] = value();
     });
   }
+  // ENC-23: the Romanian letters show as soon as the language typed is Romanian.
+  elements.defaultLanguage.addEventListener("input", () => {
+    settings.draft.language = languageValue();
+    render();
+  });
   // UI-13: the theme shows at once; Cancel puts the saved one back.
   elements.defaultTheme.addEventListener("change", () => {
     settings.draft.theme = elements.defaultTheme.value;
@@ -149,15 +189,19 @@ function bindButtons() {
       runUpdateAction(action);
     }
   });
+  elements.updatePromptLater.addEventListener("click", () => elements.updatePrompt.close());
+  elements.updatePromptAct.addEventListener("click", () =>
+    runUpdateAction(elements.updatePromptAct.dataset.updateAction, renderUpdatePromptMessage),
+  );
 }
 
-async function tryCall(call) {
+async function tryCall(call, showMessage = renderSettingsMessage) {
   try {
     await call();
     return true;
   } catch (error) {
     if (!settings.context.handleFailure(error)) {
-      renderSettingsMessage(settings.context.errorMessage(error));
+      showMessage(settings.context.errorMessage(error));
     }
     return false;
   }
@@ -184,8 +228,37 @@ async function restore() {
   renderSettingsMessage(SETTINGS_TEXT.restored);
 }
 
-async function runUpdateAction(action) {
-  renderSettingsMessage("");
-  await tryCall(UPDATE_CALLS[action]);
+// `showMessage` puts a failure where the step was asked for: in Settings or in the prompt.
+async function runUpdateAction(action, showMessage = renderSettingsMessage) {
+  showMessage("");
+  if (action === UPDATE_ACTIONS.check) {
+    await checkForUpdate();
+    return;
+  }
+  await tryCall(UPDATE_CALLS[action], showMessage);
   await settings.context.refresh();
+}
+
+// UPDATE-01: as in CineSort, a check someone asked for says what it found, so a click never
+// looks like nothing happened.
+async function checkForUpdate() {
+  settings.check = { ...NO_CHECK, isChecking: true };
+  render();
+  try {
+    settings.check = checkOutcome(await api.checkForUpdate());
+  } catch (error) {
+    if (settings.context.handleFailure(error)) {
+      return;
+    }
+    settings.check = { ...NO_CHECK, note: settings.context.errorMessage(error), isWarning: true };
+  }
+  await settings.context.refresh();
+}
+
+// A newer version needs no note: the card shows it.
+function checkOutcome(update) {
+  if (update.checkFailed) {
+    return { ...NO_CHECK, note: UPDATE_TEXT.checkFailed, isWarning: true };
+  }
+  return { ...NO_CHECK, note: update.latest ? "" : UPDATE_TEXT.checkedLatest };
 }

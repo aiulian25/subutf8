@@ -36,6 +36,8 @@ pub enum SkipCause {
     NotRegularFile,
     /// NAME-06: every numbered name up to LIMIT-03 exists.
     NoFreeName,
+    /// NAME-11: the name is not UTF-8 and does not decode in the file's encoding.
+    NameNotDecodable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

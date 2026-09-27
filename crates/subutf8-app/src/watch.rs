@@ -115,12 +115,14 @@ pub fn look_once(app: &AppState, progress: &mut Progress) {
             unavailable_folders.push(folder.clone());
             continue;
         };
+        // WATCH-05: when the output folder lies inside this watched folder, the outputs written
+        // there are never taken as new files. A watched folder inside the output folder is
+        // watched as usual, since outputs never land in it.
+        let outputs_inside = output_folder
+            .as_ref()
+            .filter(|output| needs_output_folder && output.starts_with(&real));
         for file in scan.files {
-            // WATCH-05: outputs written into the output folder are never taken as new files.
-            let is_output = needs_output_folder
-                && output_folder
-                    .as_ref()
-                    .is_some_and(|output| file.path.starts_with(output));
+            let is_output = outputs_inside.is_some_and(|output| file.path.starts_with(output));
             let Some(stamp) = FileStamp::of(&file.path).filter(|_| !is_output) else {
                 continue;
             };
@@ -170,9 +172,9 @@ fn convert_settled(
             history.outputs().collect(),
         )
     };
-    let settings = defaults
-        .session_settings()
-        .batch_settings(CollisionPolicy::Skip);
+    let session_settings = defaults.session_settings();
+    let language = session_settings.language.as_ref();
+    let settings = session_settings.batch_settings(CollisionPolicy::Skip);
     let mut jobs = Vec::new();
     let mut for_review = Vec::new();
     let mut entries = Vec::new();
@@ -183,23 +185,24 @@ fn convert_settled(
             continue;
         }
         let path = file.path.clone();
-        let prepared = prepare_listed(file, settings.language.as_ref());
-        let encoding = match prepared.status() {
-            FileStatus::Ready(encoding) => Some(encoding),
+        let prepared = prepare_listed(file, language);
+        let reading = match prepared.status() {
+            FileStatus::Ready(reading) => Some(reading),
             FileStatus::ConvertedCopy(original) => {
                 entries.push((path, WatchResult::ConvertedCopy(original.to_owned())));
                 continue;
             }
             _ => None,
         };
-        let Some(encoding) = encoding else {
+        let Some(reading) = reading else {
             entries.push((path, WatchResult::Listed));
             for_review.push(prepared);
             continue;
         };
         jobs.push(ConversionJob {
             origin: prepared.origin,
-            encoding,
+            reading,
+            language: language.cloned(),
         });
     }
     if !for_review.is_empty() {
@@ -215,9 +218,7 @@ fn convert_settled(
     let records = jobs
         .iter()
         .zip(&outcomes)
-        .filter_map(|(job, outcome)| {
-            HistoryRecord::of(job, outcome, settings.language.as_ref(), true)
-        })
+        .filter_map(|(job, outcome)| HistoryRecord::of(job, outcome, true))
         .collect();
     lock(&app.history).append(records);
     for (job, outcome) in jobs.iter().zip(outcomes) {
@@ -303,5 +304,51 @@ mod tests {
         }
         assert_eq!(names(&watched.join("Show")), ["Film.srt", "Film1.srt"]);
         assert_eq!(lock(&app.history).search("Film.srt").len(), 1);
+    }
+
+    /// WATCH-05: a watched folder inside the output folder is watched as usual, while an output
+    /// folder inside a watched folder is left out of it.
+    #[test]
+    fn output_folders_and_watched_folders_can_nest() {
+        let root = tempfile::tempdir().unwrap();
+        let watched = root.path().join("incoming");
+        fs::create_dir_all(&watched).unwrap();
+        let app = test_state(root.path(), root.path());
+        {
+            let mut store = lock(&app.defaults);
+            let mut defaults = store.current.clone();
+            defaults.destination = DestinationName::OutputFolder;
+            defaults.watch_folders = vec![fs::canonicalize(&watched).unwrap()];
+            store.save(defaults).unwrap();
+        }
+        fs::copy(
+            fixture_source("windows-1250-romanian"),
+            watched.join("Film.srt"),
+        )
+        .unwrap();
+        let mut progress = Progress::default();
+        for _ in 0..4 {
+            look_once(&app, &mut progress);
+        }
+        assert_eq!(
+            fs::read_to_string(root.path().join("Film.srt")).unwrap(),
+            fixture_output("windows-1250-romanian")
+        );
+        assert_eq!(names(&watched), ["Film.srt"]);
+
+        // The output folder inside the watched one: what lands there is never taken.
+        let output = watched.join("converted");
+        fs::create_dir_all(&output).unwrap();
+        fs::copy(fixture_source("markup"), output.join("Other.srt")).unwrap();
+        {
+            let mut store = lock(&app.defaults);
+            let mut defaults = store.current.clone();
+            defaults.output_folder = fs::canonicalize(&output).unwrap();
+            store.save(defaults).unwrap();
+        }
+        for _ in 0..4 {
+            look_once(&app, &mut progress);
+        }
+        assert_eq!(names(&output), ["Other.srt"]);
     }
 }

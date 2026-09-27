@@ -1,7 +1,9 @@
 import { ApiError, api, connect } from "./api.js";
 import {
   BROWSE_MODES,
+  BROWSE_RAW_KEY_PREFIX,
   BUSY_POLL_MILLISECONDS,
+  DESTINATIONS,
   HIDDEN_NAME_PREFIX,
   IDLE_POLL_MILLISECONDS,
   KEYS,
@@ -13,17 +15,31 @@ import {
   SEARCH_KEY,
   SRT_EXTENSION,
   PICKED_CALLBACK,
+  STATUSES,
   TEXT,
   UNAUTHORIZED_STATUS,
   UPDATE_STEPS,
 } from "./constants.js";
-import { applyTheme, dialogElements, renderUpdateBanner, setUpDialogs } from "./dialogs.js";
+import {
+  applyTheme,
+  dialogElements,
+  renderUpdateBanner,
+  setUpDialogs,
+  setUpLanguageList,
+} from "./dialogs.js";
 import { openSearch, setUpSearch } from "./search.js";
 import { Selection } from "./selection.js";
-import { isSettingsOpen, openSettings, refreshSettings, setUpSettingsDialog } from "./settings.js";
+import {
+  isSettingsOpen,
+  openSettings,
+  refreshSettings,
+  refreshUpdatePrompt,
+  setUpSettingsDialog,
+} from "./settings.js";
 import {
   disableControls,
   elements,
+  fileName,
   fill,
   focusBrowseEntry,
   focusFileRow,
@@ -36,13 +52,12 @@ import {
   renderMode,
   renderPreview,
   renderProgress,
-  renderSettings,
+  renderWriteSkipped,
+  saveFile,
   setDragging,
-  setUpSettings,
   showBrowsePath,
   showListMessage,
   showNotice,
-  showSettingsMessage,
 } from "./view.js";
 
 const model = {
@@ -51,7 +66,10 @@ const model = {
   selection: new Selection(),
   previewKey: null,
   preview: null,
-  encodingMessage: "",
+  candidatesKey: null,
+  candidates: [],
+  // What the last encoding or language choice in the preview could not do.
+  choiceMessage: "",
   pollTimer: null,
   isStopped: false,
   isBannerDismissed: false,
@@ -79,6 +97,12 @@ function hasNativePicker() {
   return typeof window.ipc?.postMessage === "function";
 }
 
+// UI-17: the desktop window cannot save downloads; a browser, beside the window or instead of
+// it, can.
+function canDownload() {
+  return !hasNativePicker();
+}
+
 function isBusy() {
   return model.app?.conversion != null;
 }
@@ -96,16 +120,30 @@ function focusedFile() {
   return model.app?.files.find((file) => file.id === model.selection.focus) ?? null;
 }
 
-// A chosen encoding applies to every selected file that takes one, or else to the file shown.
-function encodingTargets() {
+// A choice applies to every selected file it fits, or else to the file shown.
+function choiceTargets(fits) {
   const selected = (model.app?.files ?? []).filter(
-    (file) => model.selection.has(file.id) && file.canChooseEncoding,
+    (file) => model.selection.has(file.id) && fits(file),
   );
   const focused = focusedFile();
-  if (selected.length > 0 || !focused?.canChooseEncoding) {
+  if (selected.length > 0 || !focused || !fits(focused)) {
     return selected;
   }
   return [focused];
+}
+
+// UI-16: a language fits every file.
+function languageTargets() {
+  return choiceTargets(() => true);
+}
+
+function encodingTargets() {
+  return choiceTargets((file) => file.canChooseEncoding);
+}
+
+// ENC-22.
+function repairTargets() {
+  return choiceTargets((file) => file.canRepair);
 }
 
 function errorMessage(error) {
@@ -159,9 +197,9 @@ function render() {
     selection.selectOnly(ids[0]);
   }
   renderFiles(app.files, selection, isBusy());
-  renderSettings(app.settings, isBusy());
   renderMode(app.mode, app.windowOpen, hasNativePicker());
-  renderProgress(app.files, app.conversion);
+  renderProgress(app.files, app.conversion, canDownload());
+  renderWriteSkipped(app.files, app.defaults, isBusy());
   renderUpdateBanner(app.update, model.isBannerDismissed);
   if (app.mode === MODES.container && app.roots.length === 0) {
     showNotice(TEXT.noMounts);
@@ -171,6 +209,7 @@ function render() {
     applyTheme(app.defaults.theme);
   }
   refreshSettings();
+  refreshUpdatePrompt();
 }
 
 async function refreshPreview() {
@@ -180,13 +219,74 @@ async function refreshPreview() {
     renderEmptyPreview(TEXT.selectFile);
     return;
   }
-  const key = JSON.stringify([file.id, file.status, file.encoding, file.output]);
+  // ENC-23: the letters shown follow the file's language and the saved choice.
+  const { language, romanianCommaLetters } = model.app.defaults;
+  const key = JSON.stringify([
+    file.id,
+    file.status,
+    file.reading,
+    file.output,
+    file.language,
+    language,
+    romanianCommaLetters,
+  ]);
   if (key !== model.previewKey) {
+    const preview = await api.preview(file.id);
     model.previewKey = key;
-    model.preview = await api.preview(file.id);
+    model.preview = preview;
   }
-  const targets = encodingTargets().length;
-  renderPreview(file, model.preview, model.encodings, model.encodingMessage, targets);
+  await refreshCandidates(file);
+  // A slow answer about a file that changed or lost the focus meanwhile is not shown, and a
+  // language still being typed is not thrown away.
+  if (focusedFile() !== file || isTypingLanguage(file)) {
+    return;
+  }
+  renderPreview(file, model.preview, {
+    encodings: model.encodings,
+    message: model.choiceMessage,
+    targets: encodingTargets().length,
+    languageTargets: languageTargets().length,
+    savedLanguage: model.app.defaults.language,
+    candidates: model.candidates,
+    agreeingCount: agreeingFiles(file).length,
+    repairTargets: repairTargets().length,
+    canDownload: canDownload(),
+  });
+}
+
+// UI-16: the language box holds text that differs from the file's language, and has the focus.
+function isTypingLanguage(file) {
+  const input = document.getElementById("file-language-input");
+  const typed = input?.value.trim().toLowerCase() ?? "";
+  return document.activeElement === input && typed !== (file.language ?? "").toLowerCase();
+}
+
+// ENC-20: the files whose folders agree on the same encoding as this file's, this one included.
+function agreeingFiles(file) {
+  if (file.problem?.reason !== REASONS.folderAgrees) {
+    return [];
+  }
+  const { encoding } = file.problem;
+  return model.app.files.filter(
+    (other) =>
+      other.problem?.reason === REASONS.folderAgrees && other.problem.encoding === encoding,
+  );
+}
+
+// UI-15: suggestions for a file that needs review, asked for again only when it changes.
+async function refreshCandidates(file) {
+  if (!file.canChooseEncoding || file.status !== STATUSES.needsReview) {
+    model.candidatesKey = null;
+    model.candidates = [];
+    return;
+  }
+  const key = JSON.stringify([file.id, file.encoding, model.app.defaults.language]);
+  if (key === model.candidatesKey) {
+    return;
+  }
+  const { candidates } = await api.candidates(file.id);
+  model.candidatesKey = key;
+  model.candidates = candidates;
 }
 
 async function perform(action) {
@@ -308,36 +408,13 @@ async function handleDrop(event) {
   await uploadFiles(files);
 }
 
-function currentSettings() {
-  const { settings } = model.app;
-  return {
-    language: elements.languageInput.value.trim() || null,
-    destination: elements.destinationSelect.value,
-    outputFolder: settings.outputFolder,
-    organiseByDay: elements.byDayCheckbox.checked,
-    collisionPolicy: elements.collisionSelect.value,
-  };
-}
-
-async function saveSettings(changes) {
-  try {
-    await api.saveSettings({ ...currentSettings(), ...changes });
-    showSettingsMessage("");
-  } catch (error) {
-    if (handleFailure(error)) {
-      return;
-    }
-    showSettingsMessage(errorMessage(error));
-  }
-  await refresh();
-}
-
-async function chooseEncoding(encoding) {
-  const targets = encodingTargets();
+// A choice made in the preview applies to each target file in turn; refusals are reported
+// together, with the first one's reason.
+async function applyToFiles(targets, call, refusedTemplate) {
   const refusals = [];
   for (const file of targets) {
     try {
-      await api.chooseEncoding(file.id, encoding);
+      await call(file);
     } catch (error) {
       if (handleFailure(error)) {
         return;
@@ -345,12 +422,32 @@ async function chooseEncoding(encoding) {
       refusals.push({ file, error });
     }
   }
-  model.encodingMessage = encodingMessage(targets, refusals);
+  model.choiceMessage = refusalMessage(targets, refusals, refusedTemplate);
   model.previewKey = null;
   await refresh();
 }
 
-function encodingMessage(targets, refusals) {
+// ENC-21: files that can keep their UTF-8 lines do so when the box is ticked.
+async function chooseEncoding(encoding, targets = encodingTargets()) {
+  const keep = document.getElementById("keep-utf8-lines")?.checked ?? false;
+  const choose = (file) => api.chooseEncoding(file.id, encoding, keep && file.canKeepUtf8Lines);
+  await applyToFiles(targets, choose, TEXT.encodingRefused);
+}
+
+// UI-16: an empty language makes the files follow Settings again.
+async function chooseLanguage(text) {
+  const language = text.trim() || null;
+  const choose = (file) => api.setLanguage(file.id, language);
+  await applyToFiles(languageTargets(), choose, TEXT.languageRefused);
+}
+
+// ENC-22: Repair, or Keep as it is.
+async function chooseRepair(repair) {
+  const choose = (file) => api.repair(file.id, repair);
+  await applyToFiles(repairTargets(), choose, TEXT.repairRefused);
+}
+
+function refusalMessage(targets, refusals, template) {
   const [first] = refusals;
   if (!first) {
     return "";
@@ -358,7 +455,7 @@ function encodingMessage(targets, refusals) {
   if (targets.length === 1) {
     return errorMessage(first.error);
   }
-  return fill(TEXT.encodingRefused, {
+  return fill(template, {
     count: refusals.length,
     name: first.file.name,
     reason: errorMessage(first.error),
@@ -378,7 +475,7 @@ function selectFile(id) {
 function showSelection() {
   renderFiles(model.app.files, model.selection, isBusy());
   focusFileRow(model.selection.focus);
-  model.encodingMessage = "";
+  model.choiceMessage = "";
   refreshPreview().catch(handleFailure);
 }
 
@@ -428,13 +525,37 @@ function bindFileTable() {
 
 function bindPreview() {
   elements.previewBody.addEventListener("change", (event) => {
-    if (event.target.id === "encoding-select") {
-      chooseEncoding(event.target.value);
+    const isEncodingChoice = ["encoding-select", "keep-utf8-lines"].includes(event.target.id);
+    if (isEncodingChoice) {
+      chooseEncoding(document.getElementById("encoding-select").value);
+      return;
+    }
+    if (event.target.id === "file-language-input") {
+      chooseLanguage(event.target.value);
     }
   });
   elements.previewBody.addEventListener("click", (event) => {
     if (event.target.id === "encoding-confirm") {
       chooseEncoding(document.getElementById("encoding-select").value);
+      return;
+    }
+    if (event.target.id === "use-for-all-agreeing") {
+      const file = focusedFile();
+      chooseEncoding(file.problem.encoding, agreeingFiles(file));
+      return;
+    }
+    if (event.target.id === "repair-yes" || event.target.id === "repair-no") {
+      chooseRepair(event.target.id === "repair-yes");
+      return;
+    }
+    if (event.target.id === "download-file") {
+      const file = focusedFile();
+      perform(() => downloadFile(file));
+      return;
+    }
+    const suggestion = event.target.closest("[data-candidate]")?.dataset.candidate;
+    if (suggestion) {
+      chooseEncoding(suggestion);
     }
   });
 }
@@ -449,16 +570,32 @@ function browseShortcuts() {
 }
 
 // The entries shown, in order: folders, then files, matching the filter.
+// The rows' keys, in the order they are shown: folders, files, then files whose names are not
+// UTF-8 (NAME-11).
 function browsePaths() {
   const { listing, mode, filter } = model.browse;
   if (!listing) {
     return [];
   }
-  const names =
-    mode === BROWSE_MODES.files ? [...listing.folders, ...listing.files] : listing.folders;
-  return names
-    .filter((name) => name.toLowerCase().includes(filter.toLowerCase()))
-    .map((name) => joinPath(listing.path, name));
+  const shown = (name) => name.toLowerCase().includes(filter.toLowerCase());
+  const isFileMode = mode === BROWSE_MODES.files;
+  const names = isFileMode ? [...listing.folders, ...listing.files] : listing.folders;
+  const paths = names.filter(shown).map((name) => joinPath(listing.path, name));
+  if (!isFileMode) {
+    return paths;
+  }
+  const rawKeys = listing.rawFiles
+    .filter(({ display }) => shown(display))
+    .map(({ hex }) => BROWSE_RAW_KEY_PREFIX + hex);
+  return [...paths, ...rawKeys];
+}
+
+// NAME-11: a file whose name is not UTF-8 is added by its path's bytes.
+function requestedPath(key) {
+  if (!key.startsWith(BROWSE_RAW_KEY_PREFIX)) {
+    return key;
+  }
+  return { hex: key.slice(BROWSE_RAW_KEY_PREFIX.length) };
 }
 
 function renderBrowseDialog() {
@@ -548,7 +685,7 @@ async function confirmBrowse() {
     return;
   }
   elements.browseDialog.close();
-  await addPaths(selected, elements.subfoldersCheckbox.checked);
+  await addPaths(selected.map(requestedPath), elements.subfoldersCheckbox.checked);
 }
 
 async function addCurrentFolder() {
@@ -627,8 +764,14 @@ async function handlePicked(pick, paths) {
   if (paths.length === 0) {
     return;
   }
+  // NAME-11: files come as strings, or by their bytes when their names are not UTF-8; an
+  // output folder must have a UTF-8 name.
+  const [folder] = paths;
+  if (pick === NATIVE_PICKS.outputFolder && typeof folder === "string") {
+    await onFolderChosen?.(folder);
+    return;
+  }
   if (pick === NATIVE_PICKS.outputFolder) {
-    await onFolderChosen?.(paths[0]);
     return;
   }
   await addPaths(paths, pick !== NATIVE_PICKS.files);
@@ -654,15 +797,10 @@ function chooseFolder(startPath, onFolderChosen) {
   openBrowse(BROWSE_MODES.folder, startPath, onFolderChosen);
 }
 
-function chooseOutputFolder() {
-  chooseFolder(model.app?.settings.outputFolder, (path) => saveSettings({ outputFolder: path }));
-}
-
 function bindBrowseDialog() {
   elements.browseButton.addEventListener("click", () =>
     openBrowse(BROWSE_MODES.files, model.app?.browseStart),
   );
-  elements.outputFolderButton.addEventListener("click", chooseOutputFolder);
   elements.browseCrumbs.addEventListener("click", (event) => {
     const path = event.target.closest("[data-path]")?.dataset.path;
     if (path) {
@@ -733,9 +871,36 @@ function bindDragAndDrop() {
   });
 }
 
+// UI-17: each file is saved under its output name.
+async function downloadFile(file) {
+  saveFile(await api.output(file.id), fileName(file.output));
+}
+
+// UI-17: one after another, in list order.
+function downloadConverted() {
+  const converted = model.app.files.filter((file) => file.status === STATUSES.converted);
+  return perform(async () => {
+    for (const file of converted) {
+      await downloadFile(file);
+    }
+  });
+}
+
+// UI-18: the output folder becomes where files are written, as choosing it in Settings does
+// (SET-01), and the skipped files are converted again.
+function writeSkippedToOutputFolder() {
+  const defaults = { ...model.app.defaults, destination: DESTINATIONS.outputFolder };
+  return perform(async () => {
+    await api.saveDefaults(defaults);
+    await api.convert();
+  });
+}
+
 function bindControls() {
   elements.clearButton.addEventListener("click", () => perform(() => api.clear()));
   elements.convertButton.addEventListener("click", () => perform(() => api.convert()));
+  elements.writeSkippedButton.addEventListener("click", writeSkippedToOutputFolder);
+  elements.downloadAllButton.addEventListener("click", downloadConverted);
   elements.cancelButton.addEventListener("click", () => perform(() => api.cancel()));
   elements.quitButton.addEventListener("click", async () => {
     await api.quit().catch(() => null);
@@ -744,10 +909,6 @@ function bindControls() {
     showNotice(TEXT.stopped);
     disableControls();
   });
-  elements.languageInput.addEventListener("change", () => saveSettings({}));
-  elements.destinationSelect.addEventListener("change", () => saveSettings({}));
-  elements.collisionSelect.addEventListener("change", () => saveSettings({}));
-  elements.byDayCheckbox.addEventListener("change", () => saveSettings({}));
 }
 
 // The Settings and Search dialogs, and the update banner, which opens Settings at Updates.
@@ -783,7 +944,6 @@ function bindDialogs() {
 }
 
 async function start() {
-  setUpSettings();
   connect();
   if (hasNativePicker()) {
     bindNativePicker();
@@ -795,7 +955,9 @@ async function start() {
   bindControls();
   bindDialogs();
   try {
-    model.encodings = await api.encodings();
+    const [encodings, languages] = await Promise.all([api.encodings(), api.languages()]);
+    model.encodings = encodings;
+    setUpLanguageList(languages.hinted);
   } catch (error) {
     if (handleFailure(error)) {
       return;

@@ -3,10 +3,14 @@ use std::slice;
 
 use encoding_rs::{
     BIG5_INIT, Decoder, DecoderResult, EUC_JP_INIT, EUC_KR_INIT, Encoding, GB18030_INIT, GBK_INIT,
-    SHIFT_JIS_INIT, UTF_8, UTF_16BE, UTF_16LE,
+    SHIFT_JIS_INIT, UTF_8, UTF_16BE, UTF_16LE, WINDOWS_1252,
 };
 
-use crate::constants::{C1_CONTROL_CHARACTERS, UTF8_MAXIMUM_CHARACTER_BYTES};
+use crate::constants::{
+    C1_CONTROL_CHARACTERS, LATIN1_NAME, MIXED_READING_SEPARATOR, REPAIRED_READING_SUFFIX,
+    UTF8_BYTE_ORDER_MARK, UTF8_MAXIMUM_CHARACTER_BYTES,
+};
+use crate::srt_structure::{line_number_at, split_byte_lines};
 
 /// ENC-17: encodings whose standard decoders map a few duplicate byte sequences to one
 /// character, so their round trip may differ without anything being lost.
@@ -19,23 +23,123 @@ static ROUND_TRIP_MAY_DIFFER: [&Encoding; 6] = [
     &BIG5_INIT,
 ];
 
-/// Where and why strict decoding failed. Offsets count from the start of the input.
+/// Where a problem is: from the start of the file, and its line (UI-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Location {
+    pub byte_offset: usize,
+    pub line: usize,
+}
+
+impl Location {
+    /// `encoding` is the one decoding the content: the byte-order mark's, when there is one.
+    pub fn in_file(bytes: &[u8], byte_offset: usize, encoding: &'static Encoding) -> Self {
+        Self {
+            byte_offset,
+            line: line_number_at(bytes, byte_offset, encoding),
+        }
+    }
+}
+
+/// Where and why strict decoding failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodingProblem {
     /// A byte sequence the encoding does not define.
-    InvalidBytes { byte_offset: usize },
+    InvalidBytes { location: Location },
     /// A NUL or C1 control character, which means the encoding is wrong (ENC-11).
-    ControlCharacter { byte_offset: usize },
+    ControlCharacter { location: Location },
 }
 
 impl DecodingProblem {
-    pub fn byte_offset(self) -> usize {
+    pub fn location(self) -> Location {
         match self {
-            Self::InvalidBytes { byte_offset } | Self::ControlCharacter { byte_offset } => {
-                byte_offset
+            Self::InvalidBytes { location } | Self::ControlCharacter { location } => location,
+        }
+    }
+}
+
+/// A problem found by `decode_refusing`, at an offset within the bytes it was given.
+enum RawProblem {
+    InvalidBytes(usize),
+    ControlCharacter(usize),
+}
+
+impl RawProblem {
+    fn offset(&self) -> usize {
+        match self {
+            Self::InvalidBytes(offset) | Self::ControlCharacter(offset) => *offset,
+        }
+    }
+
+    /// The problem at its place in the whole file.
+    fn at(self, location: Location) -> DecodingProblem {
+        match self {
+            Self::InvalidBytes(_) => DecodingProblem::InvalidBytes { location },
+            Self::ControlCharacter(_) => DecodingProblem::ControlCharacter { location },
+        }
+    }
+}
+
+/// How a file's bytes become text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    /// ENC-04 to ENC-18: the whole file in one encoding; a byte-order mark still decides.
+    Whole(&'static Encoding),
+    /// ENC-21: lines that are valid UTF-8 stay as they are; every other line is decoded with
+    /// the encoding.
+    Utf8LinesElse(&'static Encoding),
+    /// ENC-22: a garbled UTF-8 file turned back into the bytes it was misread from, which are
+    /// decoded with their original encoding.
+    RepairMisreading(Misreading),
+}
+
+impl Reading {
+    /// The encoding chosen for the file, for its lines that are not UTF-8, or that a repair
+    /// decodes with.
+    pub fn encoding(self) -> &'static Encoding {
+        match self {
+            Self::Whole(encoding) | Self::Utf8LinesElse(encoding) => encoding,
+            Self::RepairMisreading(misreading) => misreading.original,
+        }
+    }
+
+    /// How the reading is shown and recorded: `windows-1250`, `UTF-8 + windows-1250`, or
+    /// `windows-1250 (repaired)`.
+    pub fn name(self) -> String {
+        match self {
+            Self::Whole(encoding) => encoding.name().to_owned(),
+            Self::Utf8LinesElse(encoding) => {
+                [UTF_8.name(), MIXED_READING_SEPARATOR, encoding.name()].concat()
+            }
+            Self::RepairMisreading(misreading) => {
+                [misreading.original.name(), REPAIRED_READING_SUFFIX].concat()
             }
         }
     }
+}
+
+/// ENC-22: how garbled text was read before it was saved as UTF-8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MisreadVia {
+    Windows1252,
+    /// One byte per character, which leaves C1 control characters where windows-1252 has
+    /// punctuation.
+    Latin1,
+}
+
+impl MisreadVia {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Windows1252 => WINDOWS_1252.name(),
+            Self::Latin1 => LATIN1_NAME,
+        }
+    }
+}
+
+/// ENC-22: text in the `original` encoding that was read `via` another one and saved as UTF-8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Misreading {
+    pub via: MisreadVia,
+    pub original: &'static Encoding,
 }
 
 /// A converted file. The UTF-8 bytes of `text` are the output.
@@ -47,31 +151,159 @@ pub struct Conversion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversionWarning {
-    /// ENC-17, in the CJK encodings only. The offset counts from the start of the file.
-    RoundTripDiffers { byte_offset: usize },
+    /// ENC-17, in the CJK encodings only.
+    RoundTripDiffers { location: Location },
     /// ENC-18.
     ContainsReplacementCharacters,
 }
 
-/// Why a file cannot be converted. Offsets count from the start of the file.
+/// Why a file cannot be converted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversionFailure {
     /// ENC-04.
-    DamagedUtf8 { byte_offset: usize },
+    DamagedUtf8 { location: Location },
     /// ENC-05, including UTF-32 files, which decode to NUL characters.
-    DamagedUtf16 { byte_offset: usize },
+    DamagedUtf16 { location: Location },
     /// ENC-11.
     DoesNotDecode(DecodingProblem),
     /// ENC-17, outside the CJK encodings.
-    RoundTripDiffers { byte_offset: usize },
+    RoundTripDiffers { location: Location },
+    /// ENC-22: valid UTF-8 without a byte-order mark that holds NUL or C1 control characters,
+    /// which subtitles never use.
+    ControlCharactersInUtf8 { location: Location },
 }
 
-/// ENC-11: decodes without replacing anything, refusing text with NUL or C1 characters.
+impl ConversionFailure {
+    pub fn location(self) -> Location {
+        match self {
+            Self::DamagedUtf8 { location }
+            | Self::DamagedUtf16 { location }
+            | Self::RoundTripDiffers { location }
+            | Self::ControlCharactersInUtf8 { location } => location,
+            Self::DoesNotDecode(problem) => problem.location(),
+        }
+    }
+}
+
+/// ENC-11: decodes a whole file without replacing anything, refusing text with NUL or C1
+/// characters.
 pub fn decode_strictly(
     bytes: &[u8],
     encoding: &'static Encoding,
 ) -> Result<String, DecodingProblem> {
-    decode_refusing(bytes, encoding, is_nul_or_c1_control)
+    decode_refusing(bytes, encoding, is_nul_or_c1_control).map_err(|problem| {
+        let location = Location::in_file(bytes, problem.offset(), encoding);
+        problem.at(location)
+    })
+}
+
+/// Converts a file as `reading` says: whole, line by line for a mixed file (ENC-21), or
+/// repaired (ENC-22).
+pub fn convert_reading(bytes: &[u8], reading: Reading) -> Result<Conversion, ConversionFailure> {
+    match reading {
+        Reading::Whole(encoding) => convert(bytes, encoding),
+        Reading::Utf8LinesElse(encoding) => convert_mixed(bytes, encoding),
+        Reading::RepairMisreading(misreading) => convert_repaired(bytes, misreading),
+    }
+}
+
+/// A UTF-8 file's bytes after its byte-order mark.
+fn utf8_content(bytes: &[u8]) -> &[u8] {
+    bytes
+        .strip_prefix(UTF8_BYTE_ORDER_MARK.as_bytes())
+        .unwrap_or(bytes)
+}
+
+/// ENC-22: the text of a valid UTF-8 file after its byte-order mark, NUL and C1 characters
+/// included.
+pub fn utf8_text(bytes: &[u8]) -> Option<&str> {
+    std::str::from_utf8(utf8_content(bytes)).ok()
+}
+
+/// ENC-22: the bytes garbled text was read from: through windows-1252, or through Latin-1,
+/// where each character up to U+00FF is one byte. None when a character does not fit.
+pub(crate) fn misread_bytes(text: &str, via: MisreadVia) -> Option<Vec<u8>> {
+    match via {
+        MisreadVia::Windows1252 => {
+            let (bytes, _, had_unmappable) = WINDOWS_1252.encode(text);
+            (!had_unmappable).then(|| bytes.into_owned())
+        }
+        MisreadVia::Latin1 => text
+            .chars()
+            .map(|character| u8::try_from(character).ok())
+            .collect(),
+    }
+}
+
+/// ENC-22: a garbled file's text turned back into the bytes it was misread from, which are
+/// decoded strictly with the original encoding (ENC-11) and must encode back to themselves
+/// (ENC-17). Each character became one byte, so a problem is placed at the character that
+/// became its byte.
+fn convert_repaired(bytes: &[u8], misreading: Misreading) -> Result<Conversion, ConversionFailure> {
+    let content_start = bytes.len() - utf8_content(bytes).len();
+    let text = decode_after_byte_order_mark(bytes, UTF_8, content_start)?;
+    let place = |recovered_offset: usize| {
+        let character_start = text
+            .char_indices()
+            .nth(recovered_offset)
+            .map_or(text.len(), |(start, _)| start);
+        Location::in_file(bytes, content_start + character_start, UTF_8)
+    };
+    let recovered = misread_bytes(&text, misreading.via).ok_or_else(|| {
+        ConversionFailure::DoesNotDecode(DecodingProblem::InvalidBytes { location: place(0) })
+    })?;
+    let original = misreading.original;
+    let repaired =
+        decode_refusing(&recovered, original, is_nul_or_c1_control).map_err(|problem| {
+            let location = place(problem.offset());
+            ConversionFailure::DoesNotDecode(problem.at(location))
+        })?;
+    let round_trip_difference =
+        first_round_trip_difference(&recovered, &repaired, original).map(place);
+    let warnings = warnings_for(&repaired, original, round_trip_difference)?;
+    Ok(Conversion {
+        text: repaired,
+        warnings,
+    })
+}
+
+/// ENC-21: every line that is valid UTF-8 stays as it is; every other line is decoded strictly
+/// with `encoding` and must encode back to its own bytes (ENC-17). Lines are counted as the
+/// bytes split them.
+fn convert_mixed(
+    bytes: &[u8],
+    encoding: &'static Encoding,
+) -> Result<Conversion, ConversionFailure> {
+    let content = utf8_content(bytes);
+    let mut line_start = bytes.len() - content.len();
+    let mut text = String::with_capacity(content.len());
+    let mut round_trip_difference = None;
+    for line in split_byte_lines(content) {
+        let place = |offset: usize| Location::in_file(bytes, line_start + offset, UTF_8);
+        let (read, difference) = read_mixed_line(line, encoding).map_err(|problem| {
+            let location = place(problem.offset());
+            ConversionFailure::DoesNotDecode(problem.at(location))
+        })?;
+        round_trip_difference = round_trip_difference.or(difference.map(place));
+        text.push_str(&read);
+        line_start += line.len();
+    }
+    let warnings = warnings_for(&text, encoding, round_trip_difference)?;
+    Ok(Conversion { text, warnings })
+}
+
+/// One line of a mixed file, and where its round trip first differs. Offsets count from the
+/// line's start.
+fn read_mixed_line<'line>(
+    line: &'line [u8],
+    encoding: &'static Encoding,
+) -> Result<(Cow<'line, str>, Option<usize>), RawProblem> {
+    if let Ok(text) = std::str::from_utf8(line) {
+        return Ok((Cow::Borrowed(text), None));
+    }
+    let text = decode_refusing(line, encoding, is_nul_or_c1_control)?;
+    let difference = first_round_trip_difference(line, &text, encoding);
+    Ok((Cow::Owned(text), difference))
 }
 
 /// Converts a file into text for UTF-8 output (ENC-04, ENC-05, ENC-11 and ENC-14 to ENC-18).
@@ -80,46 +312,72 @@ pub fn decode_strictly(
 pub fn convert(bytes: &[u8], encoding: &'static Encoding) -> Result<Conversion, ConversionFailure> {
     let byte_order_mark = Encoding::for_bom(bytes);
     let (source_encoding, content_start) = byte_order_mark.unwrap_or((encoding, 0));
-    let content = &bytes[content_start..];
     let text = if byte_order_mark.is_some() {
-        decode_after_byte_order_mark(content, source_encoding, content_start)?
+        decode_after_byte_order_mark(bytes, source_encoding, content_start)?
     } else {
-        decode_strictly(content, source_encoding).map_err(ConversionFailure::DoesNotDecode)?
+        decode_strictly(bytes, source_encoding)
+            .map_err(|problem| decoding_failure(problem, source_encoding))?
     };
-    let warnings = conversion_warnings(content, &text, source_encoding, content_start)?;
+    let warnings = conversion_warnings(bytes, &text, source_encoding, content_start)?;
     Ok(Conversion { text, warnings })
 }
 
+/// ENC-11, and ENC-22: in valid UTF-8, a control character says nothing about the encoding.
+fn decoding_failure(problem: DecodingProblem, encoding: &'static Encoding) -> ConversionFailure {
+    match problem {
+        DecodingProblem::ControlCharacter { location } if encoding == UTF_8 => {
+            ConversionFailure::ControlCharactersInUtf8 { location }
+        }
+        _ => ConversionFailure::DoesNotDecode(problem),
+    }
+}
+
 fn decode_after_byte_order_mark(
-    content: &[u8],
+    bytes: &[u8],
     encoding: &'static Encoding,
     content_start: usize,
 ) -> Result<String, ConversionFailure> {
+    let content = &bytes[content_start..];
     if encoding == UTF_8 {
         return String::from_utf8(content.to_vec()).map_err(|error| {
+            let byte_offset = content_start + error.utf8_error().valid_up_to();
             ConversionFailure::DamagedUtf8 {
-                byte_offset: content_start + error.utf8_error().valid_up_to(),
+                location: Location::in_file(bytes, byte_offset, encoding),
             }
         });
     }
-    decode_refusing(content, encoding, is_nul).map_err(|problem| ConversionFailure::DamagedUtf16 {
-        byte_offset: content_start + problem.byte_offset(),
+    decode_refusing(content, encoding, is_nul).map_err(|problem| {
+        let byte_offset = content_start + problem.offset();
+        ConversionFailure::DamagedUtf16 {
+            location: Location::in_file(bytes, byte_offset, encoding),
+        }
     })
 }
 
 fn conversion_warnings(
-    content: &[u8],
+    bytes: &[u8],
     text: &str,
     encoding: &'static Encoding,
     content_start: usize,
 ) -> Result<Vec<ConversionWarning>, ConversionFailure> {
+    let difference = first_round_trip_difference(&bytes[content_start..], text, encoding)
+        .map(|difference| Location::in_file(bytes, content_start + difference, encoding));
+    warnings_for(text, encoding, difference)
+}
+
+/// ENC-17 and ENC-18: a round trip that differs fails the file, except in the encodings that
+/// may differ, where it warns; replacement characters in the text warn.
+fn warnings_for(
+    text: &str,
+    encoding: &'static Encoding,
+    round_trip_difference: Option<Location>,
+) -> Result<Vec<ConversionWarning>, ConversionFailure> {
     let mut warnings = Vec::new();
-    if let Some(difference) = first_round_trip_difference(content, text, encoding) {
-        let byte_offset = content_start + difference;
+    if let Some(location) = round_trip_difference {
         if !ROUND_TRIP_MAY_DIFFER.contains(&encoding) {
-            return Err(ConversionFailure::RoundTripDiffers { byte_offset });
+            return Err(ConversionFailure::RoundTripDiffers { location });
         }
-        warnings.push(ConversionWarning::RoundTripDiffers { byte_offset });
+        warnings.push(ConversionWarning::RoundTripDiffers { location });
     }
     if text.contains(char::REPLACEMENT_CHARACTER) {
         warnings.push(ConversionWarning::ContainsReplacementCharacters);
@@ -158,7 +416,7 @@ fn is_nul(character: char) -> bool {
     character == '\0'
 }
 
-fn is_nul_or_c1_control(character: char) -> bool {
+pub(crate) fn is_nul_or_c1_control(character: char) -> bool {
     is_nul(character) || C1_CONTROL_CHARACTERS.contains(&character)
 }
 
@@ -166,17 +424,16 @@ fn decode_refusing(
     bytes: &[u8],
     encoding: &'static Encoding,
     is_refused: fn(char) -> bool,
-) -> Result<String, DecodingProblem> {
+) -> Result<String, RawProblem> {
     let mut decoder = encoding.new_decoder_without_bom_handling();
     let mut text = String::new();
-    feed(&mut decoder, bytes, &mut text, true)
-        .map_err(|byte_offset| DecodingProblem::InvalidBytes { byte_offset })?;
+    feed(&mut decoder, bytes, &mut text, true).map_err(RawProblem::InvalidBytes)?;
     let Some(position) = text.chars().position(is_refused) else {
         return Ok(text);
     };
-    Err(DecodingProblem::ControlCharacter {
-        byte_offset: byte_offset_of_character(bytes, encoding, position),
-    })
+    Err(RawProblem::ControlCharacter(byte_offset_of_character(
+        bytes, encoding, position,
+    )))
 }
 
 /// Decodes all of `input`, growing `output` as needed. An invalid sequence stops it and
@@ -238,6 +495,10 @@ mod tests {
         text.encode_utf16().flat_map(to_bytes).collect()
     }
 
+    fn at(byte_offset: usize, line: usize) -> Location {
+        Location { byte_offset, line }
+    }
+
     #[test]
     fn valid_text_decodes_unchanged() {
         assert_eq!(
@@ -255,11 +516,11 @@ mod tests {
     fn invalid_bytes_are_reported_where_they_start() {
         assert_eq!(
             decode_strictly(&[b'o', b'k', 0x80, b'!'], EUC_KR),
-            Err(DecodingProblem::InvalidBytes { byte_offset: 2 })
+            Err(DecodingProblem::InvalidBytes { location: at(2, 1) })
         );
         assert_eq!(
-            decode_strictly(&[b'o', b'k', 0x82], SHIFT_JIS),
-            Err(DecodingProblem::InvalidBytes { byte_offset: 2 })
+            decode_strictly(&[b'o', b'k', b'\n', 0x82], SHIFT_JIS),
+            Err(DecodingProblem::InvalidBytes { location: at(3, 2) })
         );
     }
 
@@ -268,21 +529,21 @@ mod tests {
     fn control_characters_are_reported_where_they_start() {
         assert_eq!(
             decode_strictly(&[b'o', b'k', 0x81, b'!'], WINDOWS_1252),
-            Err(DecodingProblem::ControlCharacter { byte_offset: 2 })
+            Err(DecodingProblem::ControlCharacter { location: at(2, 1) })
         );
         assert_eq!(
             decode_strictly(&[b'o', b'k', 0x00, b'!'], WINDOWS_1252),
-            Err(DecodingProblem::ControlCharacter { byte_offset: 2 })
+            Err(DecodingProblem::ControlCharacter { location: at(2, 1) })
         );
         let utf16_with_nul = [b'A', 0x00, 0x00, 0x00];
         assert_eq!(
             decode_strictly(&utf16_with_nul, UTF_16LE),
-            Err(DecodingProblem::ControlCharacter { byte_offset: 2 })
+            Err(DecodingProblem::ControlCharacter { location: at(2, 1) })
         );
         let shift_jis_hiragana_then_c1 = [0x82, 0xB1, 0x82, 0xF1, 0x80];
         assert_eq!(
             decode_strictly(&shift_jis_hiragana_then_c1, SHIFT_JIS),
-            Err(DecodingProblem::ControlCharacter { byte_offset: 4 })
+            Err(DecodingProblem::ControlCharacter { location: at(4, 1) })
         );
     }
 
@@ -330,12 +591,23 @@ mod tests {
         assert!(!conversion.text.starts_with('\u{FEFF}'));
     }
 
-    /// ENC-06: valid UTF-8 is never decoded as anything else, so garbled text stays as it is.
+    /// ENC-06: valid UTF-8 read as UTF-8 stays as it is; only a chosen repair (ENC-22) undoes
+    /// garbling.
     #[test]
     fn garbled_text_is_not_repaired() {
         let bytes = source("garbled-romanian");
         assert_eq!(classify(&bytes), Classification::Utf8WithoutByteOrderMark);
         assert_eq!(convert(&bytes, UTF_8).unwrap().text.as_bytes(), bytes);
+    }
+
+    /// ENC-22: a C1 character in valid UTF-8 fails on its line, not as a wrong encoding.
+    #[test]
+    fn control_characters_in_utf8_fail_on_their_line() {
+        let bytes = "1\nUn \u{96} doi\n".as_bytes();
+        assert_eq!(
+            convert(bytes, UTF_8),
+            Err(ConversionFailure::ControlCharactersInUtf8 { location: at(5, 2) })
+        );
     }
 
     /// ENC-14: only a byte-order mark at the very start is dropped.
@@ -356,7 +628,8 @@ mod tests {
         assert_eq!(convert(&big_endian, UTF_8).unwrap().text, "Bună");
     }
 
-    /// ENC-05: a file cut in the middle of a character fails where the cut is.
+    /// ENC-05: a file cut in the middle of a character fails where the cut is, on the last of
+    /// its 32 lines.
     #[test]
     fn truncated_utf16_fails_where_it_is_cut() {
         let bytes = source("utf16le-bom");
@@ -364,7 +637,7 @@ mod tests {
         assert_eq!(
             convert(truncated, UTF_8),
             Err(ConversionFailure::DamagedUtf16 {
-                byte_offset: truncated.len() - 1
+                location: at(truncated.len() - 1, 32)
             })
         );
     }
@@ -375,7 +648,7 @@ mod tests {
         let bytes = [0xEF, 0xBB, 0xBF, b'O', b'K', 0xC3];
         assert_eq!(
             convert(&bytes, UTF_8),
-            Err(ConversionFailure::DamagedUtf8 { byte_offset: 5 })
+            Err(ConversionFailure::DamagedUtf8 { location: at(5, 1) })
         );
     }
 
@@ -385,7 +658,7 @@ mod tests {
         let utf32_little_endian = [0xFF, 0xFE, 0x00, 0x00, b'H', 0x00, 0x00, 0x00];
         assert_eq!(
             convert(&utf32_little_endian, UTF_8),
-            Err(ConversionFailure::DamagedUtf16 { byte_offset: 2 })
+            Err(ConversionFailure::DamagedUtf16 { location: at(2, 1) })
         );
     }
 
@@ -428,7 +701,7 @@ mod tests {
             convert(&bytes, SHIFT_JIS),
             Ok(Conversion {
                 text: String::from("1\n纊\n"),
-                warnings: vec![ConversionWarning::RoundTripDiffers { byte_offset: 2 }]
+                warnings: vec![ConversionWarning::RoundTripDiffers { location: at(2, 2) }]
             })
         );
     }
@@ -443,6 +716,38 @@ mod tests {
                 text: String::from("Bun\u{FFFD}!"),
                 warnings: vec![ConversionWarning::ContainsReplacementCharacters]
             })
+        );
+    }
+
+    /// ENC-21: the UTF-8 half stays as it is, and only the windows-1250 half is decoded.
+    #[test]
+    fn mixed_file_keeps_utf8_lines() {
+        let bytes = source("mixed-utf8-1250");
+        let reading = Reading::Utf8LinesElse(WINDOWS_1250);
+        assert_eq!(
+            convert_reading(&bytes, reading),
+            Ok(Conversion {
+                text: expected("mixed-utf8-1250"),
+                warnings: Vec::new()
+            })
+        );
+        assert_eq!(reading.name(), "UTF-8 + windows-1250");
+        assert!(convert(&bytes, WINDOWS_1250).is_err());
+    }
+
+    /// ENC-21: a line that does not fit the encoding is named in the whole file.
+    #[test]
+    fn mixed_file_fails_on_the_line_that_does_not_fit() {
+        let bytes = ["Bună\n".as_bytes(), &[b'o', b'k', b'\n', 0x81, b'\n']].concat();
+        assert_eq!(
+            convert_reading(&bytes, Reading::Utf8LinesElse(WINDOWS_1252)),
+            Err(ConversionFailure::DoesNotDecode(
+                DecodingProblem::ControlCharacter { location: at(9, 3) }
+            ))
+        );
+        assert_eq!(
+            convert_reading(&bytes[..9], Reading::Whole(UTF_8)),
+            convert(&bytes[..9], UTF_8)
         );
     }
 }

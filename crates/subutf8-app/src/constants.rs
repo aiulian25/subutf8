@@ -103,6 +103,13 @@ pub const REPLACEMENT_SUFFIX: &str = ".new";
 pub const THEME_PLACEHOLDER: &str = "data-theme=\"system\"";
 pub const THEME_ATTRIBUTE: &str = "data-theme";
 
+/// ENC-19: a warning shown once stands for this many of its kind before others join it.
+pub const SINGLE_WARNING_COUNT: usize = 1;
+
+/// ENC-20: files of a folder detected with certainty, all with one encoding, before a short
+/// file of that folder is offered it.
+pub const FOLDER_AGREEMENT_MINIMUM_FILES: usize = 2;
+
 /// ACCESS-01.
 pub const CONTAINER_PORT: u16 = 61880;
 pub const DESKTOP_ADDRESS: [u8; 4] = [127, 0, 0, 1];
@@ -176,15 +183,30 @@ pub const DENY_FRAMING: &str = "DENY";
 pub const API_PREFIX: &str = "/api";
 pub const STATE_ROUTE: &str = "/state";
 pub const ENCODINGS_ROUTE: &str = "/encodings";
+pub const LANGUAGES_ROUTE: &str = "/languages";
 pub const BROWSE_ROUTE: &str = "/browse";
 pub const ADD_ROUTE: &str = "/add";
 pub const OPEN_ROUTE: &str = "/open";
 pub const UPLOAD_ROUTE: &str = "/upload";
 pub const PREVIEW_ROUTE: &str = "/files/{id}/preview";
+pub const CANDIDATES_ROUTE: &str = "/files/{id}/candidates";
 pub const ENCODING_ROUTE: &str = "/files/{id}/encoding";
+pub const LANGUAGE_ROUTE: &str = "/files/{id}/language";
+pub const REPAIR_ROUTE: &str = "/files/{id}/repair";
+pub const OUTPUT_ROUTE: &str = "/files/{id}/output";
+
+/// UI-17: a converted file is sent as a SubRip attachment, named as RFC 8187 allows any name.
+pub const SUBRIP_CONTENT_TYPE: &str = "application/x-subrip; charset=utf-8";
+pub const ATTACHMENT_DISPOSITION_PREFIX: &str = "attachment; filename*=UTF-8''";
+/// RFC 3986: besides letters and digits, the characters a name keeps without percent-encoding.
+pub const UNRESERVED_NAME_PUNCTUATION: &[u8] = b"-._~";
+
+/// NAME-11: a path that is not UTF-8 travels as its bytes in hexadecimal.
+pub const HEX_RADIX: u32 = 16;
+pub const HEX_DIGITS_PER_BYTE: usize = 2;
+pub const INVALID_HEX_MESSAGE: &str = "a path's hexadecimal does not read";
 pub const REMOVE_ROUTE: &str = "/files/{id}/remove";
 pub const CLEAR_ROUTE: &str = "/clear";
-pub const SETTINGS_ROUTE: &str = "/settings";
 pub const CONVERT_ROUTE: &str = "/convert";
 pub const CANCEL_ROUTE: &str = "/cancel";
 pub const QUIT_ROUTE: &str = "/quit";

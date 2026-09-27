@@ -1,22 +1,26 @@
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::Duration;
 
 use encoding_rs::Encoding;
 use serde::{Deserialize, Serialize};
 use subutf8_core::batch::{CollisionPolicy, Destination, Origin};
-use subutf8_core::decoding::{ConversionFailure, ConversionWarning};
-use subutf8_core::detection::{ManualChoiceRefusal, ReviewReason};
+use subutf8_core::classification::Classification;
+use subutf8_core::decoding::{ConversionFailure, ConversionWarning, Location, Reading};
+use subutf8_core::detection::{Candidate, ManualChoiceRefusal, ReviewReason};
 use subutf8_core::input_scan::{SkipReason, SkippedPath};
-use subutf8_core::preview::PreviewCue;
 use subutf8_core::report::{FailureCause, Outcome, SkipCause};
 use subutf8_core::srt_structure::StructureWarning;
 
+use crate::constants::SINGLE_WARNING_COUNT;
 use crate::defaults::{Defaults, DefaultsStore, StoreProblem};
 use crate::folders::Listing;
 use crate::history::HistoryRecord;
+use crate::json_path::encode_hex;
 use crate::session::{
-    FileEntry, FileStatus, Gathered, PreviewProblem, ReadProblem, Refusal, ReviewCause, Session,
+    FileEntry, FilePreview, FileStatus, Gathered, PreviewProblem, ReadProblem, Refusal,
+    ReviewCause, Session,
 };
 use crate::settings::{Mode, Settings};
 use crate::update::{Package, Step, UpdateProblem, UpdateState};
@@ -55,7 +59,8 @@ pub enum Reason {
     NotSrt,
     OutsideAllowedArea,
     NotAFolder,
-    NameNotUtf8,
+    InvalidPath,
+    NameNotDecodable,
     AlreadyExists,
     NameTakenInList,
     ListedFile,
@@ -78,6 +83,10 @@ pub enum Reason {
     NotAvailable,
     Internal,
     ConvertedCopy,
+    FolderAgrees,
+    LooksGarbled,
+    ControlCharactersInUtf8,
+    NotConverted,
     WaitingInList,
     SettingsDamaged,
     SettingsUnreadable,
@@ -104,7 +113,9 @@ pub enum Reason {
 }
 
 /// A reason with the details that make it actionable: where a file stops decoding, the
-/// system's own words for a read or write error, or the file it concerns.
+/// system's own words for a read or write error, the file it concerns, the encoding and how
+/// many files agree on it (ENC-20), or the encoding garbled text was and how it was misread
+/// (ENC-22).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Problem {
@@ -112,9 +123,17 @@ pub struct Problem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub byte_offset: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub system_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub related_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub misread_as: Option<&'static str>,
 }
 
 impl Problem {
@@ -122,8 +141,12 @@ impl Problem {
         Self {
             reason,
             byte_offset: None,
+            line: None,
             system_reason: None,
             related_name: None,
+            count: None,
+            encoding: None,
+            misread_as: None,
         }
     }
 
@@ -134,9 +157,10 @@ impl Problem {
         }
     }
 
-    fn at(reason: Reason, byte_offset: usize) -> Self {
+    fn at(reason: Reason, location: Location) -> Self {
         Self {
-            byte_offset: Some(byte_offset),
+            byte_offset: Some(location.byte_offset),
+            line: Some(location.line),
             ..Self::of(reason)
         }
     }
@@ -158,8 +182,10 @@ pub enum WarningName {
     MissingCueNumber,
     CueNumberOutOfOrder,
     MalformedTiming,
+    TimingUsesDot,
 }
 
+/// A warning, and how many of its kind it stands for (ENC-19).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WarningView {
@@ -168,6 +194,7 @@ pub struct WarningView {
     byte_offset: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     line: Option<usize>,
+    count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -178,13 +205,24 @@ pub struct FileView {
     /// The folder of a browsed file; dropped files have none (SAFE-02).
     folder: Option<String>,
     status: StatusName,
+    /// The encoding the file is read with, as the Encoding menu names it.
     encoding: Option<&'static str>,
+    /// ENC-21: how the file is read, as shown: `windows-1250` or `UTF-8 + windows-1250`.
+    reading: Option<String>,
     problem: Option<Problem>,
     output: Option<String>,
     warnings: Vec<WarningView>,
     can_choose_encoding: bool,
+    /// ENC-21: a damaged or mixed file can keep its lines that are UTF-8, and whether it does.
+    can_keep_utf8_lines: bool,
+    keeps_utf8_lines: bool,
+    /// ENC-22: a garbled file can be repaired or kept as it is, and whether it is repaired.
+    can_repair: bool,
+    is_repaired: bool,
     /// UI-05: the next conversion includes this file.
     is_pending: bool,
+    /// UI-16: the file's own subtitle language only; the saved one is in the defaults.
+    language: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,17 +247,6 @@ pub enum CollisionName {
     Overwrite,
 }
 
-/// UI-05: the bottom bar, as shown and as sent back when changed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SettingsView {
-    pub language: Option<String>,
-    pub destination: DestinationName,
-    pub output_folder: String,
-    pub organise_by_day: bool,
-    pub collision_policy: CollisionName,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ProgressView {
     finished: usize,
@@ -232,14 +259,13 @@ pub struct StateView {
     mode: ModeName,
     version: &'static str,
     files: Vec<FileView>,
-    settings: SettingsView,
     conversion: Option<ProgressView>,
     browse_start: String,
     /// The folders the app may use; in Docker, the mounted ones (TARGET-02).
     roots: Vec<String>,
     /// The desktop app shows itself in its own window, where closing the window quits.
     window_open: bool,
-    /// SET-01: what the Settings dialog shows.
+    /// SET-01: the saved settings, which every conversion uses.
     defaults: Defaults,
     /// SET-02: why settings or the history cannot be kept.
     data_problem: Option<Problem>,
@@ -334,7 +360,16 @@ pub struct ListingView {
     parent: Option<String>,
     folders: Vec<String>,
     files: Vec<String>,
+    /// NAME-11: `.srt` files whose names are not UTF-8.
+    raw_files: Vec<RawEntryView>,
     is_truncated: bool,
+}
+
+/// NAME-11: a name shown as far as it reads, and its path's bytes to add it by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RawEntryView {
+    display: String,
+    hex: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -360,24 +395,54 @@ pub struct CueView {
     is_clipped: bool,
 }
 
+/// UI-14.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrokenLineView {
+    line: usize,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreviewView {
     encoding: Option<&'static str>,
     cues: Vec<CueView>,
     problem: Option<Problem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    broken_line: Option<BrokenLineView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repair: Option<RepairView>,
+}
+
+/// ENC-22: a garbled file's first accented line, as it is and repaired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairView {
+    as_is: String,
+    repaired: String,
+}
+
+/// UI-19: the languages that steer detection (ENC-13); the page adds common ones that only name
+/// outputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LanguagesView {
+    pub hinted: Vec<&'static str>,
+}
+
+/// UI-15.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CandidatesView {
+    candidates: Vec<CandidateView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CandidateView {
+    encoding: &'static str,
+    sample: String,
 }
 
 fn text_of(path: &Path) -> String {
     path.to_string_lossy().into_owned()
-}
-
-impl From<Destination> for DestinationName {
-    fn from(destination: Destination) -> Self {
-        match destination {
-            Destination::BesideOriginals => Self::BesideOriginals,
-            Destination::OutputFolder => Self::OutputFolder,
-        }
-    }
 }
 
 impl From<DestinationName> for Destination {
@@ -385,16 +450,6 @@ impl From<DestinationName> for Destination {
         match destination {
             DestinationName::BesideOriginals => Self::BesideOriginals,
             DestinationName::OutputFolder => Self::OutputFolder,
-        }
-    }
-}
-
-impl From<CollisionPolicy> for CollisionName {
-    fn from(policy: CollisionPolicy) -> Self {
-        match policy {
-            CollisionPolicy::Skip => Self::Skip,
-            CollisionPolicy::Rename => Self::Rename,
-            CollisionPolicy::Overwrite => Self::Overwrite,
         }
     }
 }
@@ -418,17 +473,6 @@ pub fn state_view(settings: &Settings, session: &Session, extras: StateExtras) -
         mode,
         version: env!("CARGO_PKG_VERSION"),
         files: session.files.iter().map(file_view).collect(),
-        settings: SettingsView {
-            language: session
-                .settings
-                .language
-                .as_ref()
-                .map(|language| language.tag().to_owned()),
-            destination: session.settings.destination.into(),
-            output_folder: text_of(&session.settings.output_folder),
-            organise_by_day: session.settings.organise_by_day,
-            collision_policy: session.settings.collision_policy.into(),
-        },
         conversion: session.conversion.as_ref().map(|conversion| ProgressView {
             finished: conversion.finished,
             total: conversion.total,
@@ -616,17 +660,28 @@ fn file_view(file: &FileEntry) -> FileView {
         Origin::Disk { path, .. } => path.parent().map(text_of),
         Origin::Dropped { .. } => None,
     };
+    let reading = file.current_reading();
+    let is_mixed = file.classification == Ok(Classification::DamagedOrMixedUtf8);
     FileView {
         id: file.id,
         name: file.display_name(),
         folder,
         status: description.status,
-        encoding: file.current_encoding().map(Encoding::name),
+        encoding: reading.map(|reading| reading.encoding().name()),
+        reading: reading.map(Reading::name),
         problem: description.problem,
         output: description.output,
         warnings: description.warnings,
         can_choose_encoding: file.can_choose_encoding(),
-        is_pending: file.pending_encoding().is_some(),
+        can_keep_utf8_lines: file.can_choose_encoding() && is_mixed,
+        keeps_utf8_lines: matches!(reading, Some(Reading::Utf8LinesElse(_))),
+        can_repair: file.can_repair(),
+        is_repaired: matches!(reading, Some(Reading::RepairMisreading(_))),
+        is_pending: file.pending_reading().is_some(),
+        language: file
+            .language
+            .as_ref()
+            .map(|language| language.tag().to_owned()),
     }
 }
 
@@ -634,7 +689,7 @@ fn describe(status: FileStatus<'_>) -> Description {
     match status {
         FileStatus::Ready(_) => Description::plain(StatusName::Ready),
         FileStatus::NeedsReview { cause, .. } => {
-            Description::with_problem(StatusName::NeedsReview, Problem::of(review_reason(cause)))
+            Description::with_problem(StatusName::NeedsReview, review_problem(cause))
         }
         FileStatus::Refused(refusal) => describe_refusal(refusal),
         FileStatus::Finished(outcome) => describe_outcome(outcome),
@@ -642,6 +697,22 @@ fn describe(status: FileStatus<'_>) -> Description {
             StatusName::Skipped,
             Problem::about(Reason::ConvertedCopy, original),
         ),
+    }
+}
+
+fn review_problem(cause: ReviewCause) -> Problem {
+    match cause {
+        ReviewCause::FolderAgrees(agreement) => Problem {
+            count: Some(agreement.files),
+            encoding: Some(agreement.encoding.name()),
+            ..Problem::of(Reason::FolderAgrees)
+        },
+        ReviewCause::LooksGarbled(misreading) => Problem {
+            encoding: Some(misreading.original.name()),
+            misread_as: Some(misreading.via.name()),
+            ..Problem::of(Reason::LooksGarbled)
+        },
+        _ => Problem::of(review_reason(cause)),
     }
 }
 
@@ -654,6 +725,8 @@ fn review_reason(cause: ReviewCause) -> Reason {
         }
         ReviewCause::LooksLikeUtf16 => Reason::LooksLikeUtf16,
         ReviewCause::DamagedOrMixedUtf8 => Reason::DamagedOrMixedUtf8,
+        ReviewCause::FolderAgrees(_) => Reason::FolderAgrees,
+        ReviewCause::LooksGarbled(_) => Reason::LooksGarbled,
     }
 }
 
@@ -665,10 +738,13 @@ fn describe_refusal(refusal: Refusal) -> Description {
         Refusal::NotText => {
             Description::with_problem(StatusName::Failed, Problem::of(Reason::NotText))
         }
-        Refusal::DamagedUtf8 { byte_offset } => Description::with_problem(
+        Refusal::DamagedUtf8 { location } => Description::with_problem(
             StatusName::Failed,
-            Problem::at(Reason::DamagedUtf8, byte_offset),
+            Problem::at(Reason::DamagedUtf8, location),
         ),
+        Refusal::NameNotDecodable => {
+            Description::with_problem(StatusName::Skipped, Problem::of(Reason::NameNotDecodable))
+        }
         Refusal::Read(problem) => describe_read_problem(problem),
     }
 }
@@ -702,11 +778,7 @@ fn describe_outcome(outcome: &Outcome) -> Description {
             warnings: warnings
                 .iter()
                 .map(|warning| conversion_warning_view(*warning))
-                .chain(
-                    structure_warnings
-                        .iter()
-                        .map(|warning| structure_warning_view(*warning)),
-                )
+                .chain(grouped_structure_warnings(structure_warnings))
                 .collect(),
             ..Description::plain(StatusName::Converted)
         },
@@ -732,6 +804,7 @@ fn skip_reason(cause: SkipCause) -> Reason {
         SkipCause::FolderNotWritable => Reason::FolderNotWritable,
         SkipCause::NotRegularFile => Reason::NotRegularFile,
         SkipCause::NoFreeName => Reason::NoFreeName,
+        SkipCause::NameNotDecodable => Reason::NameNotDecodable,
     }
 }
 
@@ -747,33 +820,29 @@ fn failure_problem(cause: FailureCause) -> Problem {
 }
 
 fn conversion_problem(failure: ConversionFailure) -> Problem {
-    match failure {
-        ConversionFailure::DamagedUtf8 { byte_offset } => {
-            Problem::at(Reason::DamagedUtf8, byte_offset)
-        }
-        ConversionFailure::DamagedUtf16 { byte_offset } => {
-            Problem::at(Reason::DamagedUtf16, byte_offset)
-        }
-        ConversionFailure::DoesNotDecode(problem) => {
-            Problem::at(Reason::DoesNotDecode, problem.byte_offset())
-        }
-        ConversionFailure::RoundTripDiffers { byte_offset } => {
-            Problem::at(Reason::RoundTripDiffers, byte_offset)
-        }
-    }
+    let reason = match failure {
+        ConversionFailure::DamagedUtf8 { .. } => Reason::DamagedUtf8,
+        ConversionFailure::DamagedUtf16 { .. } => Reason::DamagedUtf16,
+        ConversionFailure::DoesNotDecode(_) => Reason::DoesNotDecode,
+        ConversionFailure::RoundTripDiffers { .. } => Reason::RoundTripDiffers,
+        ConversionFailure::ControlCharactersInUtf8 { .. } => Reason::ControlCharactersInUtf8,
+    };
+    Problem::at(reason, failure.location())
 }
 
 fn conversion_warning_view(warning: ConversionWarning) -> WarningView {
     match warning {
-        ConversionWarning::RoundTripDiffers { byte_offset } => WarningView {
+        ConversionWarning::RoundTripDiffers { location } => WarningView {
             warning: WarningName::RoundTripDiffers,
-            byte_offset: Some(byte_offset),
-            line: None,
+            byte_offset: Some(location.byte_offset),
+            line: Some(location.line),
+            count: SINGLE_WARNING_COUNT,
         },
         ConversionWarning::ContainsReplacementCharacters => WarningView {
             warning: WarningName::ContainsReplacementCharacters,
             byte_offset: None,
             line: None,
+            count: SINGLE_WARNING_COUNT,
         },
     }
 }
@@ -786,12 +855,33 @@ fn structure_warning_view(warning: StructureWarning) -> WarningView {
             (WarningName::CueNumberOutOfOrder, Some(line))
         }
         StructureWarning::MalformedTiming { line } => (WarningName::MalformedTiming, Some(line)),
+        StructureWarning::TimingUsesDot { line } => (WarningName::TimingUsesDot, Some(line)),
     };
     WarningView {
         warning,
         byte_offset: None,
         line,
+        count: SINGLE_WARNING_COUNT,
     }
+}
+
+/// ENC-19: each kind of warning shows once, at its first line, with how many there are, so a
+/// file with a thousand cues cannot flood the page.
+fn grouped_structure_warnings(warnings: &[StructureWarning]) -> Vec<WarningView> {
+    let mut grouped: Vec<WarningView> = Vec::new();
+    for view in warnings
+        .iter()
+        .map(|warning| structure_warning_view(*warning))
+    {
+        match grouped
+            .iter_mut()
+            .find(|group| group.warning == view.warning)
+        {
+            Some(group) => group.count += 1,
+            None => grouped.push(view),
+        }
+    }
+    grouped
 }
 
 /// SAFE-11 to SAFE-13 and NAME-01, for a path that cannot be browsed or added.
@@ -802,7 +892,6 @@ pub fn skip_reason_problem(reason: SkipReason) -> Problem {
         SkipReason::NotSrt => Problem::of(Reason::NotSrt),
         SkipReason::OutsideAllowedArea => Problem::of(Reason::OutsideAllowedArea),
         SkipReason::NotAFolder => Problem::of(Reason::NotAFolder),
-        SkipReason::NameNotUtf8 => Problem::of(Reason::NameNotUtf8),
         SkipReason::Unreadable(kind) => Problem::system(Reason::Unreadable, kind),
     }
 }
@@ -813,17 +902,26 @@ pub fn manual_choice_problem(refusal: ManualChoiceRefusal) -> Problem {
         ManualChoiceRefusal::NotOffered => Problem::of(Reason::NotOffered),
         ManualChoiceRefusal::NotApplicable => Problem::of(Reason::NotApplicable),
         ManualChoiceRefusal::DoesNotDecode(problem) => {
-            Problem::at(Reason::DoesNotDecode, problem.byte_offset())
+            Problem::at(Reason::DoesNotDecode, problem.location())
         }
     }
 }
 
 pub fn listing_view(listing: Listing) -> ListingView {
+    let raw_files = listing
+        .raw_files
+        .iter()
+        .map(|name| RawEntryView {
+            display: name.to_string_lossy().into_owned(),
+            hex: encode_hex(listing.path.join(name).as_os_str().as_bytes()),
+        })
+        .collect();
     ListingView {
         path: text_of(&listing.path),
         parent: listing.parent.as_deref().map(text_of),
         folders: listing.folders,
         files: listing.files,
+        raw_files,
         is_truncated: listing.is_truncated,
     }
 }
@@ -846,16 +944,23 @@ pub fn gathered_view(added: usize, gathered: Gathered) -> AddedView {
     added_view(added, gathered.skipped, gathered.limit_reached)
 }
 
-pub fn preview_view(
-    encoding: Option<&'static Encoding>,
-    preview: Result<Vec<PreviewCue>, PreviewProblem>,
-) -> PreviewView {
-    let (cues, problem) = match preview {
-        Ok(cues) => (cues, None),
+pub fn preview_view(encoding: Option<&'static Encoding>, preview: FilePreview) -> PreviewView {
+    let (cues, problem, broken_line) = match preview.cues {
+        Ok(cues) => (cues, None, None),
         Err(PreviewProblem::Read(problem)) => {
-            (Vec::new(), Some(read_problem_description(problem).1))
+            (Vec::new(), Some(read_problem_description(problem).1), None)
         }
-        Err(PreviewProblem::Conversion(failure)) => (Vec::new(), Some(conversion_problem(failure))),
+        Err(PreviewProblem::Conversion {
+            failure,
+            broken_line,
+        }) => (
+            Vec::new(),
+            Some(conversion_problem(failure)),
+            Some(BrokenLineView {
+                line: broken_line.line,
+                text: broken_line.text,
+            }),
+        ),
     };
     PreviewView {
         encoding: encoding.map(Encoding::name),
@@ -869,5 +974,50 @@ pub fn preview_view(
             })
             .collect(),
         problem,
+        broken_line,
+        repair: preview.repair_sample.map(|sample| RepairView {
+            as_is: sample.as_is,
+            repaired: sample.repaired,
+        }),
+    }
+}
+
+pub fn candidates_view(candidates: Vec<Candidate>) -> CandidatesView {
+    CandidatesView {
+        candidates: candidates
+            .into_iter()
+            .map(|candidate| CandidateView {
+                encoding: candidate.encoding.name(),
+                sample: candidate.sample,
+            })
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ENC-19.
+    #[test]
+    fn structure_warnings_are_grouped_by_kind() {
+        let warnings = [
+            StructureWarning::MalformedTiming { line: 2 },
+            StructureWarning::MissingCueNumber { line: 5 },
+            StructureWarning::MalformedTiming { line: 6 },
+            StructureWarning::MalformedTiming { line: 10 },
+        ];
+        let grouped: Vec<(WarningName, Option<usize>, usize)> =
+            grouped_structure_warnings(&warnings)
+                .into_iter()
+                .map(|view| (view.warning, view.line, view.count))
+                .collect();
+        assert_eq!(
+            grouped,
+            [
+                (WarningName::MalformedTiming, Some(2), 3),
+                (WarningName::MissingCueNumber, Some(5), 1),
+            ]
+        );
     }
 }

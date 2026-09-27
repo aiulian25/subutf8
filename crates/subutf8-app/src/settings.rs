@@ -4,6 +4,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use subutf8_core::batch::folder_is_writable;
 use subutf8_core::input_scan::AllowedArea;
 
 use crate::access::{NoRandomness, allowed_hosts, generate_token};
@@ -16,6 +17,7 @@ use crate::constants::{
     OUTPUT_ROOT, ROOT_FOLDER, UPDATE_CHECK_OFF, UPDATE_CHECK_VARIABLE, USER_FOLDERS_FILE,
     WATCH_INTERVAL_VARIABLE,
 };
+use crate::folders::list_folder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -117,20 +119,48 @@ fn container_settings(extra_hosts: &str, extra_roots: &str, output_root: &Path) 
     let output_mount = fs::canonicalize(output_root)
         .ok()
         .filter(|output| allowed_area.roots().contains(output));
+    let default_output_folder = output_mount
+        .clone()
+        .or_else(|| first_writable_folder(&allowed_area))
+        .unwrap_or_else(|| first_root.clone());
     Settings {
         mode: Mode::Container,
         token: None,
         allowed_hosts: allowed_hosts(&extra_hosts),
         listen_address: SocketAddr::from((Ipv4Addr::from(CONTAINER_ADDRESS), CONTAINER_PORT)),
         allowed_area,
-        browse_start: first_root.clone(),
+        browse_start: first_root,
         has_output_mount: output_mount.is_some(),
-        default_output_folder: output_mount.unwrap_or(first_root),
+        default_output_folder,
         data_folder: PathBuf::from(CONTAINER_DATA_FOLDER),
         watch_interval: DEFAULT_WATCH_INTERVAL,
         update_check_allowed: true,
         files_to_open: Vec::new(),
     }
+}
+
+/// TARGET-04: without `/output`, the first allowed folder, or else the first folder directly
+/// inside one in the order Browse lists them, that a conversion could write to (SAFE-03). A
+/// linked folder counts where it really is, and only inside the allowed area.
+fn first_writable_folder(area: &AllowedArea) -> Option<PathBuf> {
+    let roots = area.roots();
+    let folders_inside = roots.iter().flat_map(|root| folders_inside(root, area));
+    roots
+        .iter()
+        .cloned()
+        .chain(folders_inside)
+        .find(|folder| folder_is_writable(folder))
+}
+
+fn folders_inside(root: &Path, area: &AllowedArea) -> Vec<PathBuf> {
+    let Ok(listing) = list_folder(root, area) else {
+        return Vec::new();
+    };
+    listing
+        .folders
+        .iter()
+        .filter_map(|name| area.real_location(&listing.path.join(name)).ok())
+        .collect()
 }
 
 /// WATCH-01: whole seconds, never below the minimum.
@@ -169,6 +199,11 @@ fn downloads_folder(home: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::Permissions;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    const READ_ONLY_FOLDER: u32 = 0o555;
+    const WRITABLE_FOLDER: u32 = 0o755;
 
     #[test]
     fn desktop_listens_on_loopback_only_with_a_system_chosen_port() {
@@ -199,9 +234,33 @@ mod tests {
         assert!(roots.contains(&fs::canonicalize(first.path()).unwrap()));
         assert!(roots.contains(&fs::canonicalize(second.path()).unwrap()));
         assert_eq!(settings.browse_start, roots[0]);
-        assert_eq!(settings.default_output_folder, roots[0]);
+        assert!(folder_is_writable(&settings.default_output_folder));
+        assert!(roots.contains(&settings.default_output_folder));
         assert!(!settings.has_output_mount);
         assert_eq!(settings.data_folder, Path::new(CONTAINER_DATA_FOLDER));
+    }
+
+    /// TARGET-04: without `/output`, the first folder a conversion could write to. Hidden
+    /// folders, and links that lead outside the allowed area, are passed over.
+    #[test]
+    fn container_output_folder_is_the_first_writable_mount() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".cache")).unwrap();
+        fs::create_dir_all(root.path().join("subs")).unwrap();
+        symlink(outside.path(), root.path().join("a-link")).unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        for folder in [root.path(), bare.path()] {
+            fs::set_permissions(folder, Permissions::from_mode(READ_ONLY_FOLDER)).unwrap();
+        }
+        let found = first_writable_folder(&AllowedArea::new([root.path().to_path_buf()]));
+        let nothing = first_writable_folder(&AllowedArea::new([bare.path().to_path_buf()]));
+        for folder in [root.path(), bare.path()] {
+            fs::set_permissions(folder, Permissions::from_mode(WRITABLE_FOLDER)).unwrap();
+        }
+        let subs = fs::canonicalize(root.path()).unwrap().join("subs");
+        assert_eq!(found, Some(subs));
+        assert_eq!(nothing, None);
     }
 
     /// TARGET-04.

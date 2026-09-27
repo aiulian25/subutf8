@@ -44,6 +44,9 @@ pub struct Defaults {
     pub theme: Theme,
     pub watch_folders: Vec<PathBuf>,
     pub update_check: bool,
+    /// ENC-23: missing from files saved before 1.2.0, which then keep the letters as decoded.
+    #[serde(default)]
+    pub romanian_comma_letters: bool,
 }
 
 impl Defaults {
@@ -63,10 +66,11 @@ impl Defaults {
             theme: Theme::System,
             watch_folders: Vec::new(),
             update_check: true,
+            romanian_comma_letters: false,
         }
     }
 
-    /// UI-05: the bottom bar starts from these.
+    /// SET-01: the list converts with these.
     pub fn session_settings(&self) -> SessionSettings {
         SessionSettings {
             language: self
@@ -77,6 +81,7 @@ impl Defaults {
             output_folder: self.output_folder.clone(),
             organise_by_day: self.organise_by_day,
             collision_policy: self.collision_policy.into(),
+            romanian_comma_letters: self.romanian_comma_letters,
         }
     }
 }
@@ -186,6 +191,7 @@ mod tests {
             theme: Theme::Dark,
             watch_folders: vec![folder.join("incoming")],
             update_check: false,
+            romanian_comma_letters: true,
         }
     }
 
@@ -212,6 +218,26 @@ mod tests {
             PRIVATE_FILE_PERMISSIONS
         );
         assert_eq!(DefaultsStore::load(&data, factory).current, changed);
+    }
+
+    /// SET-02 and ENC-23: a file saved by 1.1.0, without the Romanian letters, still loads.
+    #[test]
+    fn defaults_saved_before_the_romanian_letters_still_load() {
+        let data = tempfile::tempdir().unwrap();
+        let mut saved = serde_json::to_value(example(data.path())).unwrap();
+        saved
+            .as_object_mut()
+            .unwrap()
+            .remove("romanianCommaLetters");
+        fs::write(data.path().join(DEFAULTS_FILE_NAME), saved.to_string()).unwrap();
+        let factory = Defaults {
+            language: None,
+            ..example(data.path())
+        };
+        let store = DefaultsStore::load(data.path(), factory);
+        assert_eq!(store.problem, None);
+        assert!(!store.current.romanian_comma_letters);
+        assert_eq!(store.current.language.as_deref(), Some("ro"));
     }
 
     /// SET-02: a damaged file is reported and left for Save to replace.

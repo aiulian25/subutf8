@@ -133,7 +133,7 @@ function settingResults(app, words) {
 function fileResults(app, words) {
   return app.files
     .filter((file) => {
-      const text = [file.name, file.folder, STATUS_LABELS[file.status], file.encoding, file.output];
+      const text = [file.name, file.folder, STATUS_LABELS[file.status], file.reading, file.output];
       return matchesAll(text.filter(Boolean).join(" "), words);
     })
     .map((file) => ({

@@ -1,8 +1,8 @@
 import {
   BROWSE_MODES,
-  COLLISION_OPTIONS,
-  DESTINATION_OPTIONS,
-  LANGUAGE_SUGGESTIONS,
+  BROWSE_RAW_KEY_PREFIX,
+  DESTINATIONS,
+  DOWNLOAD_ADDRESS_LIFETIME_MILLISECONDS,
   MODES,
   PATH_SEPARATOR,
   PLACEHOLDER_PATTERN,
@@ -29,20 +29,14 @@ export const elements = {
   browseButton: document.getElementById("browse-button"),
   clearButton: document.getElementById("clear-button"),
   listMessage: document.getElementById("list-message"),
+  writeSkippedButton: document.getElementById("write-skipped-button"),
   fileRows: document.getElementById("file-rows"),
   emptyList: document.getElementById("empty-list"),
   previewBody: document.getElementById("preview-body"),
-  languageInput: document.getElementById("language-input"),
-  languageList: document.getElementById("language-list"),
-  destinationSelect: document.getElementById("destination-select"),
-  outputFolderPath: document.getElementById("output-folder-path"),
-  outputFolderButton: document.getElementById("output-folder-button"),
-  byDayCheckbox: document.getElementById("by-day-checkbox"),
-  collisionSelect: document.getElementById("collision-select"),
-  settingsMessage: document.getElementById("settings-message"),
   progress: document.getElementById("progress"),
   summary: document.getElementById("summary"),
   cancelButton: document.getElementById("cancel-button"),
+  downloadAllButton: document.getElementById("download-all-button"),
   convertButton: document.getElementById("convert-button"),
   browseDialog: document.getElementById("browse-dialog"),
   browseTitle: document.getElementById("browse-title"),
@@ -72,17 +66,19 @@ export function problemText(problem) {
   }
   const template = REASON_MESSAGES[problem.reason] ?? REASON_MESSAGES[REASONS.internal];
   return fill(template, {
-    offset: problem.byteOffset,
+    line: problem.line,
     system: problem.systemReason,
     name: problem.relatedName,
+    count: problem.count,
+    encoding: problem.encoding,
+    misreadAs: problem.misreadAs,
   });
 }
 
+// ENC-19: one line per kind of warning, counting the others of its kind.
 function warningText(warning) {
-  return fill(WARNING_MESSAGES[warning.warning] ?? "", {
-    offset: warning.byteOffset,
-    line: warning.line,
-  });
+  const more = warning.count > 1 ? fill(TEXT.moreLines, { count: warning.count - 1 }) : "";
+  return fill(WARNING_MESSAGES[warning.warning] ?? "", { line: warning.line, more });
 }
 
 // Long paths are shown by their last parts; the full path is in the tooltip.
@@ -102,6 +98,19 @@ function pathLabel(className, path, shown = shortPath(path)) {
 
 export function fileName(path) {
   return path.split(PATH_SEPARATOR).pop();
+}
+
+// UI-17: saves a file the page fetched, under the given name, from an address that lives only
+// in this page.
+export function saveFile(blob, name) {
+  const address = URL.createObjectURL(blob);
+  const link = create("a");
+  link.href = address;
+  link.download = name;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(address), DOWNLOAD_ADDRESS_LIFETIME_MILLISECONDS);
 }
 
 export function joinPath(folder, name) {
@@ -129,18 +138,6 @@ export function fillSelect(select, options) {
   );
 }
 
-export function setUpSettings() {
-  fillSelect(elements.destinationSelect, DESTINATION_OPTIONS);
-  fillSelect(elements.collisionSelect, COLLISION_OPTIONS);
-  elements.languageList.replaceChildren(
-    ...LANGUAGE_SUGGESTIONS.map((tag) => {
-      const option = create("option");
-      option.value = tag;
-      return option;
-    }),
-  );
-}
-
 export function showNotice(message) {
   elements.notice.textContent = message;
   elements.notice.hidden = !message;
@@ -156,11 +153,6 @@ export function disableControls() {
 export function showListMessage(message) {
   elements.listMessage.textContent = message;
   elements.listMessage.hidden = !message;
-}
-
-export function showSettingsMessage(message) {
-  elements.settingsMessage.textContent = message;
-  elements.settingsMessage.hidden = !message;
 }
 
 // UI-11: in the app's own window, closing the window quits, so Quit shows only in a browser.
@@ -185,12 +177,17 @@ function fileRow(file, isSelected, isFocused, isBusy) {
   row.setAttribute("aria-selected", String(isSelected));
 
   const nameCell = create("td");
-  nameCell.append(create("div", "file-name", file.name));
+  const name = create("div", "file-name", file.name);
+  // UI-16: a file with its own subtitle language shows it.
+  if (file.language) {
+    name.append(create("span", "language-badge", file.language));
+  }
+  nameCell.append(name);
   if (file.folder) {
     nameCell.append(pathLabel("file-folder", file.folder));
   }
 
-  const encodingCell = create("td", "file-encoding", file.encoding ?? TEXT.noEncoding);
+  const encodingCell = create("td", "file-encoding", file.reading ?? TEXT.noEncoding);
 
   const statusCell = create("td");
   statusCell.append(statusBadge(file.status));
@@ -260,26 +257,6 @@ export function focusFileRow(id) {
   row?.scrollIntoView({ block: "nearest" });
 }
 
-export function renderSettings(settings, isBusy) {
-  if (document.activeElement !== elements.languageInput) {
-    elements.languageInput.value = settings.language ?? "";
-  }
-  elements.destinationSelect.value = settings.destination;
-  elements.collisionSelect.value = settings.collisionPolicy;
-  elements.outputFolderPath.textContent = shortPath(settings.outputFolder);
-  elements.outputFolderPath.title = settings.outputFolder;
-  elements.byDayCheckbox.checked = settings.organiseByDay;
-  for (const control of [
-    elements.languageInput,
-    elements.destinationSelect,
-    elements.collisionSelect,
-    elements.outputFolderButton,
-    elements.byDayCheckbox,
-  ]) {
-    control.disabled = isBusy;
-  }
-}
-
 function countBy(files) {
   const counts = new Map();
   for (const file of files) {
@@ -289,12 +266,16 @@ function countBy(files) {
 }
 
 // UI-05 to UI-07: Convert includes Ready files and those skipped or failed before.
-export function renderProgress(files, conversion) {
+// UI-17: `canDownload` is false in the desktop window, which cannot save downloads.
+export function renderProgress(files, conversion, canDownload) {
   const counts = countBy(files);
   const pendingCount = files.filter((file) => file.isPending).length;
   const isBusy = conversion !== null;
+  const convertedCount = counts.get(STATUSES.converted) ?? 0;
   elements.progress.hidden = !isBusy;
   elements.cancelButton.hidden = !isBusy;
+  elements.downloadAllButton.hidden = isBusy || !canDownload || convertedCount === 0;
+  elements.downloadAllButton.textContent = fill(TEXT.downloadAll, { count: convertedCount });
   elements.convertButton.disabled = isBusy || pendingCount === 0;
   elements.clearButton.disabled = isBusy || files.length === 0;
   if (isBusy) {
@@ -315,13 +296,34 @@ export function renderProgress(files, conversion) {
   elements.summary.textContent = parts.join(TEXT.summarySeparator);
 }
 
+// UI-18: browsed files skipped because their folder is read-only can go to the output folder;
+// dropped files go there already, so they do not count.
+export function renderWriteSkipped(files, defaults, isBusy) {
+  const count = files.filter(
+    (file) => file.folder && file.problem?.reason === REASONS.folderNotWritable,
+  ).length;
+  const button = elements.writeSkippedButton;
+  const writesBeside = defaults.destination === DESTINATIONS.besideOriginals;
+  button.hidden = isBusy || count === 0 || !writesBeside;
+  if (button.hidden) {
+    return;
+  }
+  const template =
+    count > 1 ? TEXT.writeSkippedToOutputFolder : TEXT.writeSkippedFileToOutputFolder;
+  button.textContent = fill(template, { count, folder: shortPath(defaults.outputFolder) });
+  button.title = defaults.outputFolder;
+}
+
 export function renderEmptyPreview(message) {
   elements.previewBody.replaceChildren(create("p", "muted", message));
 }
 
 // UI-04: numbers, timings and text of up to five cues, decoded with the current encoding.
-// A chosen encoding applies to every selected file that takes one.
-export function renderPreview(file, preview, encodings, encodingMessage, encodingTargets) {
+// `choice` is what choosing an encoding, a language or a repair offers: the encodings, the
+// message about the last choice, how many selected files each applies to, the saved language,
+// the suggestions (UI-15), how many files share this one's folder agreement (ENC-20), and
+// whether a converted file can be downloaded (UI-17).
+export function renderPreview(file, preview, choice) {
   const parts = [create("p", "preview-title", file.name)];
 
   const statusLine = create("p");
@@ -333,19 +335,45 @@ export function renderPreview(file, preview, encodings, encodingMessage, encodin
   if (file.output) {
     parts.push(create("p", "path", fill(TEXT.writtenTo, { path: file.output })));
   }
+  if (file.status === STATUSES.converted && choice.canDownload) {
+    const download = create("button", "primary-button download-button", TEXT.download);
+    download.type = "button";
+    download.id = "download-file";
+    parts.push(download);
+  }
   if (file.warnings.length > 0) {
     const list = create("ul", "warnings");
     list.append(...file.warnings.map((warning) => create("li", "", warningText(warning))));
     parts.push(list);
   }
 
-  parts.push(encodingControl(file, encodings, encodingTargets));
-  if (encodingMessage) {
-    parts.push(create("p", "problem", encodingMessage));
+  parts.push(encodingControl(file, choice.encodings, choice.targets));
+  if (file.canRepair && preview.repair) {
+    parts.push(...repairChoice(file, preview.repair, choice.repairTargets));
+  }
+  if (file.isPending || file.status === STATUSES.needsReview) {
+    parts.push(languageControl(file, choice));
+  }
+  if (choice.message) {
+    parts.push(create("p", "problem", choice.message));
+  }
+  if (choice.agreeingCount > 1) {
+    parts.push(useForAllAgreeingButton(file, choice.agreeingCount));
+  }
+  if (choice.candidates.length > 0) {
+    const { candidates } = choice;
+    parts.push(create("p", "muted", TEXT.suggestionsTitle), suggestionList(file, candidates));
   }
 
   if (preview.problem) {
     parts.push(create("p", "problem", problemText(preview.problem)));
+  }
+  // UI-14.
+  if (preview.brokenLine) {
+    parts.push(create("p", "muted", fill(TEXT.brokenLine, { line: preview.brokenLine.line })));
+    const block = create("div", "cue broken-line");
+    block.append(create("pre", "cue-text", preview.brokenLine.text));
+    parts.push(block);
   }
   for (const cue of preview.cues) {
     parts.push(cueBlock(cue));
@@ -356,12 +384,97 @@ export function renderPreview(file, preview, encodings, encodingMessage, encodin
   elements.previewBody.replaceChildren(...parts);
 }
 
+// UI-16: the file's own subtitle language; left empty, the file follows Settings.
+function languageControl(file, choice) {
+  const label = create("label", "preview-encoding");
+  const count = choice.languageTargets;
+  const text = count > 1 ? fill(TEXT.fileLanguageForSelected, { count }) : TEXT.fileLanguage;
+  const input = create("input", "file-language");
+  input.id = "file-language-input";
+  input.setAttribute("list", "language-list");
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  input.value = file.language ?? "";
+  const savedLanguage = choice.savedLanguage ?? TEXT.noLanguage;
+  input.placeholder = fill(TEXT.languageFromSettings, { language: savedLanguage });
+  label.append(create("span", "muted", text), input);
+  return label;
+}
+
+// ENC-20: one click gives every file its folder agrees on the same encoding.
+function useForAllAgreeingButton(file, count) {
+  const encoding = file.problem.encoding;
+  const button = create(
+    "button",
+    "primary-button",
+    fill(TEXT.useForAllAgreeing, { encoding, count }),
+  );
+  button.type = "button";
+  button.id = "use-for-all-agreeing";
+  return button;
+}
+
+// ENC-22: the first accented line as it is and repaired, then the choice, which applies to
+// every selected garbled file. The choice made is shown pressed.
+function repairChoice(file, sample, count) {
+  const asIs = create("div", "cue garbled-line");
+  asIs.append(create("pre", "cue-text", fill(TEXT.repairAsIs, { sample: sample.asIs })));
+  const repaired = create("div", "cue");
+  repaired.append(
+    create("pre", "cue-text", fill(TEXT.repairRepaired, { sample: sample.repaired })),
+  );
+  const isChosen = file.status !== STATUSES.needsReview;
+  const buttons = create("div", "repair-choice");
+  buttons.append(
+    pressableButton({
+      id: "repair-yes",
+      className: "primary-button",
+      text: count > 1 ? fill(TEXT.repairSelected, { count }) : TEXT.repair,
+      isPressed: isChosen && file.isRepaired,
+    }),
+    pressableButton({
+      id: "repair-no",
+      className: "",
+      text: count > 1 ? fill(TEXT.keepSelected, { count }) : TEXT.keepAsIs,
+      isPressed: isChosen && !file.isRepaired,
+    }),
+  );
+  return [asIs, repaired, buttons];
+}
+
+function pressableButton({ id, className, text, isPressed }) {
+  const button = create("button", className, text);
+  button.type = "button";
+  button.id = id;
+  button.setAttribute("aria-pressed", String(isPressed));
+  return button;
+}
+
+// UI-15: each suggestion shows the file's first accented line in that encoding.
+function suggestionList(file, candidates) {
+  const list = create("ul", "suggestions");
+  for (const { encoding, sample } of candidates) {
+    const button = create(
+      "button",
+      "quiet-button",
+      fill(TEXT.suggestionLabel, { encoding, sample }),
+    );
+    button.type = "button";
+    button.dataset.candidate = encoding;
+    button.setAttribute("aria-pressed", String(encoding === file.encoding));
+    const item = create("li");
+    item.append(button);
+    list.append(item);
+  }
+  return list;
+}
+
 function encodingControl(file, encodings, encodingTargets) {
   const container = create("div", "preview-encoding");
   if (!file.canChooseEncoding) {
     container.append(
       create("span", "muted", TEXT.encodingLabel),
-      create("span", "", file.encoding ?? TEXT.noEncoding),
+      create("span", "", file.reading ?? TEXT.noEncoding),
     );
     return container;
   }
@@ -381,6 +494,16 @@ function encodingControl(file, encodings, encodingTargets) {
   select.value = file.encoding ?? "";
   label.append(select);
   container.append(label);
+  // ENC-21: a damaged or mixed file keeps its lines that are already UTF-8.
+  if (file.canKeepUtf8Lines) {
+    const keep = create("label", "checkbox-label");
+    const checkbox = create("input");
+    checkbox.type = "checkbox";
+    checkbox.id = "keep-utf8-lines";
+    checkbox.checked = file.keepsUtf8Lines;
+    keep.append(checkbox, TEXT.keepUtf8Lines);
+    container.append(keep);
+  }
   if (file.status === STATUSES.needsReview) {
     const confirm = create("button", "primary-button", TEXT.useEncoding);
     confirm.type = "button";
@@ -460,13 +583,18 @@ export function renderBrowse(listing, mode, selection, shortcuts, message, filte
   const shown = (name) => name.toLowerCase().includes(filter.toLowerCase());
   const folders = (listing?.folders ?? []).filter(shown);
   const files = isFileMode ? (listing?.files ?? []).filter(shown) : [];
+  // NAME-11: names that are not UTF-8 show as far as they read, and are added by their bytes.
+  const rawFiles = isFileMode
+    ? (listing?.rawFiles ?? []).filter(({ display }) => shown(display))
+    : [];
   browseRows.clear();
   elements.browseEntries.replaceChildren(
     ...folders.map((name) => browseEntry(name, joinPath(listing.path, name), true)),
     ...files.map((name) => browseEntry(name, joinPath(listing.path, name), false)),
+    ...rawFiles.map(({ display, hex }) => browseEntry(display, BROWSE_RAW_KEY_PREFIX + hex, false)),
   );
 
-  const isEmpty = listing && folders.length === 0 && files.length === 0;
+  const isEmpty = listing && folders.length + files.length + rawFiles.length === 0;
   const notes = [
     message,
     isEmpty ? TEXT.emptyFolder : "",

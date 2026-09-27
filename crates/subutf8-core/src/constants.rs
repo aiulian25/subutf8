@@ -18,6 +18,18 @@ pub(crate) const C1_CONTROL_CHARACTERS: RangeInclusive<char> = '\u{80}'..='\u{9F
 /// ENC-14: every output starts with it, which is how MKVToolNix, Windows and many players
 /// recognise UTF-8.
 pub const UTF8_BYTE_ORDER_MARK: &str = "\u{FEFF}";
+/// ENC-21: a mixed reading is named `UTF-8 + windows-1250`.
+pub(crate) const MIXED_READING_SEPARATOR: &str = " + ";
+/// ENC-22: a repaired reading is named `windows-1250 (repaired)`.
+pub(crate) const REPAIRED_READING_SUFFIX: &str = " (repaired)";
+/// ENC-22: text read one byte per character, as ISO-8859-1 defines it.
+pub(crate) const LATIN1_NAME: &str = "Latin-1";
+/// ENC-23: the cedilla letters that windows-1250 and ISO-8859-2 give, each with the comma
+/// letter Romanian writes.
+pub(crate) const ROMANIAN_COMMA_LETTERS: [(char, char); 4] =
+    [('ş', 'ș'), ('ţ', 'ț'), ('Ş', 'Ș'), ('Ţ', 'Ț')];
+/// ENC-23: Romanian's language subtag, with or without a region.
+pub(crate) const ROMANIAN_LANGUAGE: &str = "ro";
 
 /// NAME-01.
 pub(crate) const SRT_EXTENSION: &str = ".srt";
@@ -43,6 +55,8 @@ pub(crate) const READ_WRITE_PERMISSION_BITS: u32 = 0o666;
 /// SAFE-09: outputs of dropped files, which have no original.
 pub(crate) const NEW_FILE_PERMISSIONS: u32 = 0o644;
 
+/// NAME-05: a language subtag and a region subtag, as in `pt-BR`.
+pub(crate) const SUBTAG_SEPARATOR: char = '-';
 /// NAME-05.
 pub(crate) const LANGUAGE_SUBTAG_LETTERS: RangeInclusive<usize> = 2..=3;
 /// NAME-05.
@@ -53,6 +67,12 @@ pub(crate) const REGION_SUBTAG_DIGITS: usize = 3;
 /// ENC-15: subtitle files mix all three line endings.
 pub(crate) const LINE_TERMINATORS: [char; 2] = ['\r', '\n'];
 pub(crate) const CRLF: &str = "\r\n";
+/// UI-14: line breaks in a file's bytes, before decoding.
+pub(crate) const LINE_FEED: u8 = b'\n';
+pub(crate) const CARRIAGE_RETURN: u8 = b'\r';
+pub(crate) const UTF16_LINE_FEED: u16 = 0x000A;
+pub(crate) const UTF16_CARRIAGE_RETURN: u16 = 0x000D;
+pub(crate) const FIRST_LINE_NUMBER: usize = 1;
 
 /// ENC-19.
 pub(crate) const TIMING_ARROW: &str = "-->";
@@ -60,10 +80,17 @@ pub(crate) const TIMING_ARROW: &str = "-->";
 pub(crate) const CLOCK_SEPARATOR: char = ':';
 /// ENC-19.
 pub(crate) const MILLISECONDS_SEPARATOR: char = ',';
+/// ENC-19: WebVTT writes `00:00:01.000`, and most players accept it in SRT too.
+pub(crate) const WEBVTT_MILLISECONDS_SEPARATOR: char = '.';
 /// ENC-19: minutes and seconds.
 pub(crate) const CLOCK_FIELD_DIGITS: usize = 2;
 /// ENC-19.
 pub(crate) const MILLISECONDS_DIGITS: usize = 3;
+
+/// UI-15: encodings suggested for a file that needs review.
+pub(crate) const CANDIDATE_LIMIT: usize = 6;
+/// UI-15: each suggestion's sample line is cut here.
+pub(crate) const CANDIDATE_SAMPLE_CHARACTERS: usize = 80;
 
 /// UI-04.
 pub(crate) const PREVIEW_CUES: usize = 5;

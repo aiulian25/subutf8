@@ -6,6 +6,7 @@ mod defaults;
 mod folders;
 mod history;
 mod instance;
+mod json_path;
 mod launcher;
 mod server;
 mod session;

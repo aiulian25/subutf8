@@ -1,10 +1,15 @@
+use std::ffi::OsStr;
 use std::iter;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path};
+
+use encoding_rs::{Encoding, UTF_8};
 
 use crate::constants::{
     DROPPED_NAME_PATH_SEPARATORS, FIRST_OUTPUT_NUMBER, LANGUAGE_TAG_SEPARATOR, MAXIMUM_NAME_BYTES,
     SRT_EXTENSION,
 };
+use crate::decoding::decode_strictly;
 use crate::language::SubtitleLanguage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,15 +30,33 @@ pub enum NamingProblem {
 
 /// NAME-01: the name part and the `.srt` extension, keeping their letter case.
 pub fn split_srt_name(file_name: &str) -> Option<(&str, &str)> {
+    let (name, _) = split_srt_name_bytes(file_name.as_bytes())?;
+    Some(file_name.split_at(name.len()))
+}
+
+/// NAME-01 for a name in any encoding: the extension is ASCII in every encoding that can hold
+/// names (NAME-11), so it is found in the bytes.
+pub fn split_srt_name_bytes(file_name: &[u8]) -> Option<(&[u8], &[u8])> {
     let extension_start = file_name.len().checked_sub(SRT_EXTENSION.len())?;
-    if !file_name.is_char_boundary(extension_start) {
-        return None;
-    }
     let (name, extension) = file_name.split_at(extension_start);
-    if name.is_empty() || !extension.eq_ignore_ascii_case(SRT_EXTENSION) {
+    if name.is_empty() || !extension.eq_ignore_ascii_case(SRT_EXTENSION.as_bytes()) {
         return None;
     }
     Some((name, extension))
+}
+
+/// NAME-11: the name a file's outputs are named after: its own name when it is UTF-8, else that
+/// name decoded strictly (ENC-11) with the file's encoding. UTF-8 cannot read it, and UTF-16
+/// never writes names, so neither decodes it.
+pub fn readable_name(file_name: &OsStr, encoding: &'static Encoding) -> Option<String> {
+    if let Some(name) = file_name.to_str() {
+        return Some(name.to_owned());
+    }
+    let holds_names = encoding != UTF_8 && encoding.is_ascii_compatible();
+    if !holds_names {
+        return None;
+    }
+    decode_strictly(file_name.as_bytes(), encoding).ok()
 }
 
 /// NAME-02 to NAME-04 and NAME-06: output names in the order to try. The first is the
@@ -86,6 +109,14 @@ pub fn is_output_name(candidate: &str, original: &str) -> bool {
         .strip_prefix(original_name)
         .is_some_and(|rest| !rest.is_empty() && is_number_then_tag(rest));
     is_numbered_or_tagged || is_renumbered_tagged_name(candidate_name, original_name)
+}
+
+/// NAME-02: the language an output was converted with, from the tag its name ends with, as in
+/// `Film1.ro.srt`.
+pub fn output_language(output: &str) -> Option<SubtitleLanguage> {
+    let (name, _) = split_srt_name(output)?;
+    let (_, tag) = name.rsplit_once(LANGUAGE_TAG_SEPARATOR)?;
+    SubtitleLanguage::parse(tag).ok()
 }
 
 /// What follows the original's name in an output: a number, a language tag, or both.
@@ -159,6 +190,7 @@ pub fn dropped_file_name(raw: &str) -> Result<&str, NamingProblem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use encoding_rs::{UTF_16LE, WINDOWS_1250, WINDOWS_1252};
 
     fn language(tag: &str) -> SubtitleLanguage {
         SubtitleLanguage::parse(tag).unwrap()
@@ -291,6 +323,50 @@ mod tests {
                 "{candidate} {original}"
             );
         }
+    }
+
+    /// NAME-11: "Fată" in windows-1250 reads in the file's legacy encoding, but in neither UTF-8
+    /// nor UTF-16; a UTF-8 name stays as it is.
+    #[test]
+    fn legacy_names_are_read_in_the_file_encoding() {
+        let legacy = OsStr::from_bytes(b"Fat\xe3.srt");
+        assert_eq!(
+            readable_name(legacy, WINDOWS_1250).as_deref(),
+            Some("Fată.srt")
+        );
+        for encoding in [UTF_8, UTF_16LE] {
+            assert_eq!(readable_name(legacy, encoding), None, "{}", encoding.name());
+        }
+        let with_c1 = OsStr::from_bytes(b"Bad\x81.srt");
+        assert_eq!(readable_name(with_c1, WINDOWS_1252), None);
+        assert_eq!(
+            readable_name(OsStr::new("Fată.srt"), UTF_16LE).as_deref(),
+            Some("Fată.srt")
+        );
+        assert_eq!(
+            split_srt_name_bytes(b"Fat\xe3.SRT"),
+            Some((&b"Fat\xe3"[..], &b".SRT"[..]))
+        );
+        assert_eq!(split_srt_name_bytes(b".srt"), None);
+    }
+
+    /// NAME-02 and ENC-23: an output's language is the tag its name ends with.
+    #[test]
+    fn output_language_is_the_last_tag() {
+        let names = [
+            "Film1.ro.srt",
+            "Film.en.ro-MD.srt",
+            "Film1.srt",
+            "Film.ro1.srt",
+            "Film.ro.txt",
+        ];
+        let tags: Vec<Option<String>> = names
+            .iter()
+            .map(|name| output_language(name).map(|language| language.tag().to_owned()))
+            .collect();
+        let ro = Some(String::from("ro"));
+        let ro_md = Some(String::from("ro-MD"));
+        assert_eq!(tags, [ro, ro_md, None, None, None]);
     }
 
     /// NAME-02 and NAME-03: beside the original, no candidate can take its name.

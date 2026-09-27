@@ -59,7 +59,9 @@ function parseJson(text) {
   }
 }
 
-async function request(method, path, body) {
+// Every request carries the app's header with the token (ACCESS-04); a refusal carries the
+// reason as JSON.
+async function send(method, path, body) {
   const headers = { [TOKEN_HEADER]: token };
   let payload;
   if (body instanceof Blob) {
@@ -75,11 +77,15 @@ async function request(method, path, body) {
   } catch {
     throw new ApiError(NETWORK_FAILURE_STATUS, null);
   }
-  const data = parseJson(await response.text());
   if (!response.ok) {
-    throw new ApiError(response.status, data);
+    throw new ApiError(response.status, parseJson(await response.text()));
   }
-  return data;
+  return response;
+}
+
+async function request(method, path, body) {
+  const response = await send(method, path, body);
+  return parseJson(await response.text());
 }
 
 function fileRoute(id, action) {
@@ -89,6 +95,7 @@ function fileRoute(id, action) {
 export const api = {
   state: () => request(HTTP_METHODS.get, ROUTES.state),
   encodings: () => request(HTTP_METHODS.get, ROUTES.encodings),
+  languages: () => request(HTTP_METHODS.get, ROUTES.languages),
   browse: (path) => request(HTTP_METHODS.post, ROUTES.browse, { path }),
   add: (paths, includeSubfolders) =>
     request(HTTP_METHODS.post, ROUTES.add, { paths, includeSubfolders }),
@@ -97,11 +104,17 @@ export const api = {
     return request(HTTP_METHODS.post, `${ROUTES.upload}?${query}`, file);
   },
   preview: (id) => request(HTTP_METHODS.get, fileRoute(id, FILE_ACTIONS.preview)),
-  chooseEncoding: (id, encoding) =>
-    request(HTTP_METHODS.post, fileRoute(id, FILE_ACTIONS.encoding), { encoding }),
+  candidates: (id) => request(HTTP_METHODS.get, fileRoute(id, FILE_ACTIONS.candidates)),
+  chooseEncoding: (id, encoding, keepUtf8Lines = false) =>
+    request(HTTP_METHODS.post, fileRoute(id, FILE_ACTIONS.encoding), { encoding, keepUtf8Lines }),
+  setLanguage: (id, language) =>
+    request(HTTP_METHODS.post, fileRoute(id, FILE_ACTIONS.language), { language }),
+  repair: (id, repair) =>
+    request(HTTP_METHODS.post, fileRoute(id, FILE_ACTIONS.repair), { repair }),
+  // UI-17: a plain link could not carry the token, so the page fetches the file itself.
+  output: async (id) => (await send(HTTP_METHODS.get, fileRoute(id, FILE_ACTIONS.output))).blob(),
   remove: (id) => request(HTTP_METHODS.post, fileRoute(id, FILE_ACTIONS.remove)),
   clear: () => request(HTTP_METHODS.post, ROUTES.clear),
-  saveSettings: (settings) => request(HTTP_METHODS.post, ROUTES.settings, settings),
   convert: () => request(HTTP_METHODS.post, ROUTES.convert),
   cancel: () => request(HTTP_METHODS.post, ROUTES.cancel),
   quit: () => request(HTTP_METHODS.post, ROUTES.quit),

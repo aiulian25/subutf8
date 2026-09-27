@@ -4,6 +4,7 @@ use crate::constants::{
     HUNDRED_PERCENT, MIXED_UTF8_MINIMUM_VALID_PERCENT, UTF16_CODE_UNIT_BYTES,
     UTF16_MINIMUM_NUL_PERCENT, UTF16_MINIMUM_SAME_PARITY_PERCENT,
 };
+use crate::decoding::Location;
 
 /// What rules ENC-03 to ENC-09 decide about a file's bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,8 +13,8 @@ pub enum Classification {
     Empty,
     /// ENC-04, valid.
     Utf8WithByteOrderMark,
-    /// ENC-04, invalid. The offset counts from the start of the file.
-    DamagedUtf8WithByteOrderMark { byte_offset: usize },
+    /// ENC-04, invalid.
+    DamagedUtf8WithByteOrderMark { location: Location },
     /// ENC-05. Whether the rest decodes is checked when converting.
     Utf16WithByteOrderMark(&'static Encoding),
     /// ENC-06.
@@ -62,7 +63,7 @@ fn classify_after_byte_order_mark(
     match std::str::from_utf8(content) {
         Ok(_) => Classification::Utf8WithByteOrderMark,
         Err(error) => Classification::DamagedUtf8WithByteOrderMark {
-            byte_offset: byte_order_mark_length + error.valid_up_to(),
+            location: Location::in_file(bytes, byte_order_mark_length + error.valid_up_to(), UTF_8),
         },
     }
 }
@@ -158,7 +159,12 @@ mod tests {
         let bytes = [0xEF, 0xBB, 0xBF, b'O', b'K', 0xC3];
         assert_eq!(
             classify(&bytes),
-            Classification::DamagedUtf8WithByteOrderMark { byte_offset: 5 }
+            Classification::DamagedUtf8WithByteOrderMark {
+                location: Location {
+                    byte_offset: 5,
+                    line: 1
+                }
+            }
         );
     }
 
