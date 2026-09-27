@@ -1,0 +1,43 @@
+# SubUTF8: converts .srt subtitles to UTF-8 in the browser, on this server.
+#
+#   1. Change /path/to/your/subtitles below to your subtitles folder.
+#   2. docker compose up -d
+#   3. Open http://<server-ip>:61880 from any machine on your network.
+
+services:
+  subutf8:
+    image: ghcr.io/aiulian25/subutf8:latest
+    container_name: subutf8
+    ports:
+      # There is no login: anyone who can reach this port can convert subtitles in the
+      # folders below. Use "127.0.0.1:61880:61880" to keep it on this machine only.
+      - "61880:61880"
+    # Converted files belong to this user and group; run `id -u` and `id -g` for yours,
+    # or set PUID and PGID in a .env file next to this one (see .env.example).
+    user: "${PUID:-1000}:${PGID:-1000}"
+    # environment:
+    #   # More folders to browse besides /media and /mnt, separated by colons. Only list
+    #   # folders you also mount below.
+    #   - SUBUTF8_BROWSE_ROOTS=/srv/subtitles
+    #   # Host names to answer to, for example behind a reverse proxy. IP addresses
+    #   # always work.
+    #   - SUBUTF8_ALLOWED_HOSTS=subtitles.example.lan
+    volumes:
+      # Everything mounted under /media or /mnt shows up in the app's Browse view.
+      # Converted files go beside the originals, so mount writable; add ":ro" to protect
+      # the originals and choose an output folder in the app instead.
+      - /path/to/your/subtitles:/media/subtitles
+      # More folders, for example:
+      # - /path/to/movies:/media/movies
+      # - /path/to/nas-share:/mnt/nas
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

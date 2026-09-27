@@ -1,0 +1,12 @@
+# The image build needs only these; everything else stays out of the build context.
+*
+!Cargo.lock
+!Cargo.toml
+!LICENSE
+!rust-toolchain.toml
+!crates
+crates/*/tests
+!ui
+!packaging/collect-licenses.sh
+!packaging/docker
+!packaging/icon
