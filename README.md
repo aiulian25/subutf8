@@ -1,0 +1,177 @@
+# SubUTF8
+
+**Convert subtitle files to UTF-8, safely, without touching their timing or text**
+
+SubUTF8 converts the text encoding of `.srt` subtitle files to UTF-8 without changing subtitle content or timing. It detects the old encoding, shows a preview before anything is written, and never writes over the originals. Every output is UTF-8 with a byte-order mark, the form MKVToolNix, media players and TVs recognise. Run it as a small Docker container on a server or NAS, **or** install it as a desktop app (`.deb` / `.rpm` / AppImage).
+
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.0-green.svg)
+![Platform](https://img.shields.io/badge/platform-linux%2Famd64-lightgrey.svg)
+
+---
+
+## Screenshots
+
+**Browse** — the folders mounted into the container, with breadcrumbs, a filter and file-manager selection:
+
+![Browse](docs/screenshots/browse.png)
+
+**Check before converting** — each file's detected encoding and status, with a preview of its text:
+
+![Files and preview](docs/screenshots/files.png)
+
+**Results** — every file converted and verified, next to its untouched original:
+
+![Results](docs/screenshots/results.png)
+
+*The files shown are SubUTF8's own sample subtitles, in ten different encodings.*
+
+---
+
+## Features
+
+### Conversion
+- **Encoding detection** — legacy encodings for every major language family, tuned for Romanian (windows-1250, ISO-8859-2, ISO-8859-16), plus UTF-16.
+- **Never guesses silently** — when detection is unsure, the file waits as *Needs review*; the preview shows its text in the encoding you pick before anything is written.
+- **Exact** — cue numbers, timings, text, markup such as `<i>`, blank lines and line endings (CRLF, LF, CR, even mixed) are kept byte for byte. Only the encoding changes.
+- **Recognised as UTF-8** — every output starts with a UTF-8 byte-order mark, so MKVToolNix and players identify it. Files that are already UTF-8 get the mark too.
+- **Language tags** — optionally name outputs `Film.ro.srt`, which MKVToolNix and players read as the subtitle language.
+
+### Safety
+- **Originals are never changed** — outputs go beside them (`Film1.srt`, or `Film.ro.srt` with a language) or into an output folder you choose.
+- **Verified writes** — each output is written to a temporary file, read back and checked before it gets its name. A failure leaves nothing behind.
+- **Existing outputs** — skip, rename or overwrite, as you choose. A file in the list is never overwritten.
+- **Offline** — no telemetry, no update checks, no outgoing connections.
+
+### Interface
+- **File-manager selection** — click, Ctrl+click, Shift+click, Ctrl+A, the arrow keys and Delete, in the file list and in Browse.
+- **Drag and drop** — files and whole folders.
+- **Desktop app** — its own window with the app icon in the taskbar and menu, the system's file picker, and "Open with SubUTF8" for `.srt` files.
+- **Docker** — an in-app browser for the mounted folders, with breadcrumbs, a filter, a selection kept across folders and full keyboard use.
+
+---
+
+## Quick Start
+
+### Docker (servers / NAS)
+
+```bash
+mkdir -p ~/subutf8 && cd ~/subutf8
+wget https://raw.githubusercontent.com/aiulian25/subutf8/main/docker-compose.yml
+nano docker-compose.yml # set your subtitles folder
+docker compose up -d
+```
+
+Open **http://&lt;server-ip&gt;:61880** from any machine on your network.
+
+> **Just pull, never build.** `ghcr.io/aiulian25/subutf8:latest` is a ready-made `linux/amd64` image.
+
+### Desktop (deb / rpm / AppImage — x86_64)
+
+Download the latest release from the [Releases page](https://github.com/aiulian25/subutf8/releases).
+
+**Debian / Ubuntu:**
+```bash
+sudo apt install ./subutf8_1.0.0_amd64.deb
+```
+
+**Fedora / RHEL:**
+```bash
+sudo dnf install ./subutf8-1.0.0-1.x86_64.rpm
+```
+
+**AppImage (any distro):**
+```bash
+chmod +x SubUTF8-1.0.0-x86_64.AppImage
+./SubUTF8-1.0.0-x86_64.AppImage
+```
+The first launch adds SubUTF8 to your application menu; `./SubUTF8-1.0.0-x86_64.AppImage --remove-integration` takes it out again.
+
+---
+
+## Supported Platforms
+
+| | |
+|---|---|
+| Docker image | `ghcr.io/aiulian25/subutf8`, `linux/amd64` |
+| Docker | Engine 20.10 or newer, with Compose v2 (`docker compose`) |
+| Desktop packages | x86_64: Ubuntu 22.04+, Debian 12+, Fedora 43+; the AppImage runs on any of them |
+| Desktop window | WebKitGTK 4.1, which the `.deb` and `.rpm` install. Without it the app opens in your browser |
+
+There are no arm64 builds.
+
+---
+
+## Using it
+
+1. Add files with **Add files…** or **Add folder…**, which open the system's file picker, or drag `.srt` files or whole folders onto the window. In Docker, **Browse…** shows the mounted folders.
+2. Check each file's encoding and status. Select a file to preview its text; if it reads wrongly or needs review, choose another encoding. Lists select as in a file manager: Ctrl+click, Shift+click, Ctrl+A, the arrow keys and Delete.
+3. Optionally set the subtitle language, which adds a tag such as `Film.ro.srt`, where to write, and what to do when an output already exists.
+4. Press **Convert to UTF-8** and read the results. Skipped or failed files are tried again on the next Convert, for example after choosing to overwrite.
+
+---
+
+## Configuration (Docker)
+
+### Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PUID` / `PGID` | `1000` | The user and group converted files belong to (`id -u`, `id -g`). Set them in a `.env` file next to `docker-compose.yml`; see [.env.example](.env.example) |
+| `SUBUTF8_BROWSE_ROOTS` | — | More folders to browse besides `/media` and `/mnt`, separated by colons. Mount them too |
+| `SUBUTF8_ALLOWED_HOSTS` | — | Host names to answer to besides IP addresses and `localhost`, separated by commas, for example behind a reverse proxy |
+
+### Volume mounts
+
+Everything mounted under `/media` or `/mnt` shows up in Browse. Converted files go beside the originals, so mount writable; add `:ro` to protect the originals and choose an output folder in the app instead.
+
+```yaml
+volumes:
+  # One folder
+  - /path/to/your/subtitles:/media/subtitles
+  # More folders
+  - /path/to/movies:/media/movies
+  # A network share mounted on the host
+  - /path/to/nas-share:/mnt/nas
+```
+
+### Port
+
+`61880`. Publish it as `"127.0.0.1:61880:61880"` to keep the app on the server only.
+
+---
+
+## Security
+
+- **No login.** Anyone who can reach the port can convert subtitles in the mounted folders. Use it on a trusted network, or put a reverse proxy with HTTPS and a login in front of it and add the proxy's host name to `SUBUTF8_ALLOWED_HOSTS`.
+- **Other websites are kept out.** Every request needs a header a web page on another site cannot add, and requests naming any host other than an IP address, `localhost` or an allowed name are rejected.
+- **Small and locked down.** The image holds one static program on `scratch`, runs as a non-root user with a read-only file system and no Linux capabilities, and reads and writes only the mounted folders.
+- **Desktop** — the app listens on `127.0.0.1` only, on a new random port at each launch, and every request carries a secret token.
+
+---
+
+## Troubleshooting
+
+- **"No folders are mounted"** — mount a folder under `/media` or `/mnt` (see Volume mounts) and restart the container.
+- **"Folder is read-only: choose an output folder"** — the folder is mounted `:ro` or cannot be written by `PUID:PGID`. Choose an output folder in a writable mount, or fix the mount's permissions.
+- **"The output file already exists"** — choose Rename or Overwrite under *If the output exists* and press Convert again.
+- **A file shows *Needs review*** — select it, look at the preview, and pick the encoding that makes the text read correctly.
+- **The desktop window does not open** — install WebKitGTK 4.1 (`libwebkit2gtk-4.1-0` on Debian and Ubuntu, `webkit2gtk4.1` on Fedora). Until then the app opens in your browser.
+
+---
+
+## What's New
+
+### v1.0.0
+
+The first public release.
+
+- **Recognised as UTF-8 everywhere.** Every converted file starts with a UTF-8 byte-order mark, the form MKVToolNix and players look for. Files that were already UTF-8 get the mark too, so every subtitle you mux shows up as UTF-8.
+- **Docker image and desktop packages.** Pull `ghcr.io/aiulian25/subutf8` on a server or NAS, or install the `.deb`, `.rpm` or AppImage on an x86_64 desktop.
+- **Works like a file manager.** Ctrl+click, Shift+click, Ctrl+A and the keyboard in every list; drag and drop onto the window; the system's own file picker on the desktop.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE). The licences of the included Rust crates ship inside the image and with every package.
