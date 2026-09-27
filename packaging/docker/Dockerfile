@@ -8,6 +8,9 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p subutf8-app \
     && packaging/collect-licenses.sh subutf8-app:x86_64-unknown-linux-musl >THIRD-PARTY-LICENSES.txt
+# /data holds the settings and the history. Any PUID must be able to write to a new named
+# volume there, which starts as a copy of this folder, so it is writable by all, like /tmp.
+RUN install -d -m 1777 /rootfs/data
 
 FROM scratch
 ARG VERSION=dev
@@ -18,7 +21,9 @@ LABEL org.opencontainers.image.title="SubUTF8" \
       org.opencontainers.image.version="$VERSION"
 COPY --from=build /workspace/target/release/subutf8 /subutf8
 COPY --from=build /workspace/LICENSE /workspace/THIRD-PARTY-LICENSES.txt /licenses/
-ENV SUBUTF8_MODE=container
+COPY --from=build /rootfs/ /
+ENV SUBUTF8_MODE=container \
+    SUBUTF8_DATA_DIR=/data
 USER 65532:65532
 EXPOSE 61880
 ENTRYPOINT ["/subutf8"]

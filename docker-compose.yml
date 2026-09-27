@@ -1,6 +1,6 @@
 # SubUTF8: converts .srt subtitles to UTF-8 in the browser, on this server.
 #
-#   1. Change /path/to/your/subtitles below to your subtitles folder.
+#   1. Change the two /path/to/... folders below to yours.
 #   2. docker compose up -d
 #   3. Open http://<server-ip>:61880 from any machine on your network.
 
@@ -15,17 +15,28 @@ services:
     # Converted files belong to this user and group; run `id -u` and `id -g` for yours,
     # or set PUID and PGID in a .env file next to this one (see .env.example).
     user: "${PUID:-1000}:${PGID:-1000}"
-    # environment:
-    #   # More folders to browse besides /media and /mnt, separated by colons. Only list
-    #   # folders you also mount below.
-    #   - SUBUTF8_BROWSE_ROOTS=/srv/subtitles
-    #   # Host names to answer to, for example behind a reverse proxy. IP addresses
-    #   # always work.
-    #   - SUBUTF8_ALLOWED_HOSTS=subtitles.example.lan
+    environment:
+      # Your time zone, such as Europe/London. It names the daily folders in /output.
+      - TZ=Etc/UTC
+      # # More folders to browse besides /media and /mnt, separated by colons. Only list
+      # # folders you also mount below.
+      # - SUBUTF8_BROWSE_ROOTS=/srv/subtitles
+      # # Host names to answer to, for example behind a reverse proxy. IP addresses
+      # # always work.
+      # - SUBUTF8_ALLOWED_HOSTS=subtitles.example.lan
+      # # How often watched folders are checked, in seconds (60 by default).
+      # - SUBUTF8_WATCH_INTERVAL=60
+      # # The app asks GitHub once a day whether a newer version exists; 0 turns that off.
+      # - SUBUTF8_UPDATE_CHECK=0
     volumes:
-      # Everything mounted under /media or /mnt shows up in the app's Browse view.
-      # Converted files go beside the originals, so mount writable; add ":ro" to protect
-      # the originals and choose an output folder in the app instead.
+      # Settings and the list of converted files; they survive updates of the container.
+      - subutf8-data:/data
+      # Converted files, in a folder for each day, such as 2026-09-27. Create this folder
+      # before starting, so it belongs to PUID and PGID.
+      - /path/to/converted:/output
+      # Everything mounted under /media or /mnt shows up in the app's Browse view, and can be
+      # watched for new subtitles (Settings, Watch folders). Add ":ro" to protect the
+      # originals; converted files then go to /output.
       - /path/to/your/subtitles:/media/subtitles
       # More folders, for example:
       # - /path/to/movies:/media/movies
@@ -41,3 +52,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  subutf8-data:
