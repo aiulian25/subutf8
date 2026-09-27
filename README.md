@@ -5,7 +5,7 @@
 SubUTF8 converts the text encoding of `.srt` subtitle files to UTF-8 without changing subtitle content or timing. It detects the old encoding, shows a preview before anything is written, and never writes over the originals. Every output is UTF-8 with a byte-order mark, the form MKVToolNix, media players and TVs recognise. Run it as a small Docker container on a server or NAS, **or** install it as a desktop app (`.deb` / `.rpm` / AppImage).
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version](https://img.shields.io/badge/version-1.0.0-green.svg)
+![Version](https://img.shields.io/badge/version-1.1.0-green.svg)
 ![Platform](https://img.shields.io/badge/platform-linux%2Famd64-lightgrey.svg)
 
 ---
@@ -87,20 +87,20 @@ Download the latest release from the [Releases page](https://github.com/aiulian2
 
 **Debian / Ubuntu:**
 ```bash
-sudo apt install ./subutf8_1.0.0_amd64.deb
+sudo apt install ./subutf8_1.1.0_amd64.deb
 ```
 
 **Fedora / RHEL:**
 ```bash
-sudo dnf install ./subutf8-1.0.0-1.x86_64.rpm
+sudo dnf install ./subutf8-1.1.0-1.x86_64.rpm
 ```
 
 **AppImage (any distro):**
 ```bash
-chmod +x SubUTF8-1.0.0-x86_64.AppImage
-./SubUTF8-1.0.0-x86_64.AppImage
+chmod +x SubUTF8-1.1.0-x86_64.AppImage
+./SubUTF8-1.1.0-x86_64.AppImage
 ```
-The first launch adds SubUTF8 to your application menu; `./SubUTF8-1.0.0-x86_64.AppImage --remove-integration` takes it out again. Uninstalling leaves your settings and history in `~/.config/subutf8`; delete that folder to remove them too.
+The first launch adds SubUTF8 to your application menu; `./SubUTF8-1.1.0-x86_64.AppImage --remove-integration` takes it out again. Uninstalling leaves your settings and history in `~/.config/subutf8`; delete that folder to remove them too.
 
 ### Updating
 
@@ -195,6 +195,15 @@ volumes:
 ---
 
 ## What's New
+
+### v1.1.0
+
+- **Settings.** Save your defaults (language, where to write, output folder, existing outputs) and choose a light, dark or system theme.
+- **A folder for each day.** Converted files can go into dated folders; Docker keeps them in the mounted `/output`.
+- **Search.** Ctrl+K finds settings, listed files and every file converted before, by name, folder or date.
+- **Watch folders (Docker).** New subtitles in chosen folders convert automatically with the saved defaults.
+- **Updates.** A notice when a new version is out; the desktop app downloads, verifies, installs and restarts itself.
+- **No doubled tags, no copies of copies.** `Film.ro.srt` converted with `ro` becomes `Film1.ro.srt`, not `Film.ro.ro.srt`, and SubUTF8's own outputs are left alone when their folder is added again.
 
 ### v1.0.0
 
