@@ -20,9 +20,17 @@ SubUTF8 converts the text encoding of `.srt` subtitle files to UTF-8 without cha
 
 ![Files and preview](docs/screenshots/files.png)
 
-**Results** — every file converted and verified, next to its untouched original:
+**Results** — every file converted and verified, in today's folder under `/output`, with the originals untouched:
 
 ![Results](docs/screenshots/results.png)
+
+**Search** — Ctrl+K finds settings, files in the list and every file converted before:
+
+![Search](docs/screenshots/search.png)
+
+**Settings** — the defaults SubUTF8 starts with, the theme and, in Docker, folders to watch:
+
+![Settings](docs/screenshots/settings.png)
 
 *The files shown are SubUTF8's own sample subtitles, in ten different encodings.*
 
@@ -41,7 +49,14 @@ SubUTF8 converts the text encoding of `.srt` subtitle files to UTF-8 without cha
 - **Originals are never changed** — outputs go beside them (`Film1.srt`, or `Film.ro.srt` with a language) or into an output folder you choose.
 - **Verified writes** — each output is written to a temporary file, read back and checked before it gets its name. A failure leaves nothing behind.
 - **Existing outputs** — skip, rename or overwrite, as you choose. A file in the list is never overwritten.
-- **Offline** — no telemetry, no update checks, no outgoing connections.
+- **Private** — no telemetry. The only outgoing connection is a check of GitHub for a newer release, once a day; turn it off in Settings or with `SUBUTF8_UPDATE_CHECK=0`.
+
+### Settings, search and automation
+- **Saved defaults** — subtitle language, where to write, output folder, what to do when an output exists, and a light or dark theme, in Settings.
+- **A folder for each day** — outputs can go into dated folders such as `2026-09-27`; in Docker, the mounted `/output` keeps every converted file this way.
+- **Search** — one box (**Ctrl+K**) finds settings, files in the list, and every file converted before, by name, folder, encoding, language or date.
+- **Watch folders (Docker)** — new subtitles in chosen folders are converted automatically with your saved defaults, once they have finished copying. Existing files are never replaced.
+- **Updates** — a notice when a new version is out. The desktop app downloads it, checks its SHA-256, installs it with your password and restarts; Docker shows the command to pull it.
 
 ### Interface
 - **File-manager selection** — click, Ctrl+click, Shift+click, Ctrl+A, the arrow keys and Delete, in the file list and in Browse.
@@ -58,11 +73,11 @@ SubUTF8 converts the text encoding of `.srt` subtitle files to UTF-8 without cha
 ```bash
 mkdir -p ~/subutf8 && cd ~/subutf8
 wget https://raw.githubusercontent.com/aiulian25/subutf8/main/docker-compose.yml
-nano docker-compose.yml # set your subtitles folder
+nano docker-compose.yml # set your subtitles folder, the output folder and your time zone
 docker compose up -d
 ```
 
-Open **http://&lt;server-ip&gt;:61880** from any machine on your network.
+Create the output folder before the first start, so it belongs to you (`PUID`/`PGID`). Open **http://&lt;server-ip&gt;:61880** from any machine on your network.
 
 > **Just pull, never build.** `ghcr.io/aiulian25/subutf8:latest` is a ready-made `linux/amd64` image.
 
@@ -85,7 +100,12 @@ sudo dnf install ./subutf8-1.0.0-1.x86_64.rpm
 chmod +x SubUTF8-1.0.0-x86_64.AppImage
 ./SubUTF8-1.0.0-x86_64.AppImage
 ```
-The first launch adds SubUTF8 to your application menu; `./SubUTF8-1.0.0-x86_64.AppImage --remove-integration` takes it out again.
+The first launch adds SubUTF8 to your application menu; `./SubUTF8-1.0.0-x86_64.AppImage --remove-integration` takes it out again. Uninstalling leaves your settings and history in `~/.config/subutf8`; delete that folder to remove them too.
+
+### Updating
+
+- **Desktop** — when a new version is out, SubUTF8 says so. **Settings → Updates → Download update**, then **Install update** (your password, in the system's own dialog) and **Restart SubUTF8**. The AppImage replaces itself.
+- **Docker** — `docker compose pull && docker compose up -d`. Settings and the history stay in the `subutf8-data` volume.
 
 ---
 
@@ -106,8 +126,11 @@ There are no arm64 builds.
 
 1. Add files with **Add files…** or **Add folder…**, which open the system's file picker, or drag `.srt` files or whole folders onto the window. In Docker, **Browse…** shows the mounted folders.
 2. Check each file's encoding and status. Select a file to preview its text; if it reads wrongly or needs review, choose another encoding. Lists select as in a file manager: Ctrl+click, Shift+click, Ctrl+A, the arrow keys and Delete.
-3. Optionally set the subtitle language, which adds a tag such as `Film.ro.srt`, where to write, and what to do when an output already exists.
+3. Optionally set the subtitle language, which adds a tag such as `Film.ro.srt`, where to write, and what to do when an output already exists. **Settings** saves these as the defaults, with the theme.
 4. Press **Convert to UTF-8** and read the results. Skipped or failed files are tried again on the next Convert, for example after choosing to overwrite.
+5. **Search** (Ctrl+K) finds any setting, any file in the list, and any file converted before, for example by typing `today` or a file name.
+
+In Docker, **Settings → Watch folders** adds folders whose new subtitles are converted automatically. Files that need a person, such as those whose encoding is unsure, wait in the list.
 
 ---
 
@@ -120,13 +143,20 @@ There are no arm64 builds.
 | `PUID` / `PGID` | `1000` | The user and group converted files belong to (`id -u`, `id -g`). Set them in a `.env` file next to `docker-compose.yml`; see [.env.example](.env.example) |
 | `SUBUTF8_BROWSE_ROOTS` | — | More folders to browse besides `/media` and `/mnt`, separated by colons. Mount them too |
 | `SUBUTF8_ALLOWED_HOSTS` | — | Host names to answer to besides IP addresses and `localhost`, separated by commas, for example behind a reverse proxy |
+| `TZ` | UTC | Your time zone, such as `Europe/London`; it names the daily folders and the times in the history |
+| `SUBUTF8_WATCH_INTERVAL` | `60` | How often watched folders are checked, in seconds |
+| `SUBUTF8_UPDATE_CHECK` | on | `0` turns the daily check for a new version off |
 
 ### Volume mounts
 
-Everything mounted under `/media` or `/mnt` shows up in Browse. Converted files go beside the originals, so mount writable; add `:ro` to protect the originals and choose an output folder in the app instead.
+Everything mounted under `/media` or `/mnt` shows up in Browse and can be watched. `/output` receives converted files, in a folder for each day, and `/data` keeps the settings and the history. Add `:ro` to the subtitle folders to protect the originals; converted files then go to `/output`.
 
 ```yaml
 volumes:
+  # Settings and the history
+  - subutf8-data:/data
+  # Converted files, one folder per day
+  - /path/to/converted:/output
   # One folder
   - /path/to/your/subtitles:/media/subtitles
   # More folders
@@ -147,12 +177,16 @@ volumes:
 - **Other websites are kept out.** Every request needs a header a web page on another site cannot add, and requests naming any host other than an IP address, `localhost` or an allowed name are rejected.
 - **Small and locked down.** The image holds one static program on `scratch`, runs as a non-root user with a read-only file system and no Linux capabilities, and reads and writes only the mounted folders.
 - **Desktop** — the app listens on `127.0.0.1` only, on a new random port at each launch, and every request carries a secret token.
+- **Updates** — the check and the download talk to GitHub only, over HTTPS; a download is kept only if its size and SHA-256 match the release's, and is checked again just before installing. SubUTF8 never runs as root: the package manager installs through `pkexec`, which asks for your password. The container never updates itself.
+- **Your data** — settings and the history of converted files (file names and paths, never subtitle text) stay in `~/.config/subutf8` on the desktop or `/data` in Docker, readable only by you.
 
 ---
 
 ## Troubleshooting
 
 - **"No folders are mounted"** — mount a folder under `/media` or `/mnt` (see Volume mounts) and restart the container.
+- **"The folder mounted at /output cannot be written to"** — give the server's folder to `PUID:PGID`, for example `sudo chown 1000:1000 /path/to/converted`.
+- **"Settings and the list of converted files cannot be saved"** — mount `/data`, as `docker-compose.yml` shows.
 - **"Folder is read-only: choose an output folder"** — the folder is mounted `:ro` or cannot be written by `PUID:PGID`. Choose an output folder in a writable mount, or fix the mount's permissions.
 - **"The output file already exists"** — choose Rename or Overwrite under *If the output exists* and press Convert again.
 - **A file shows *Needs review*** — select it, look at the preview, and pick the encoding that makes the text read correctly.
