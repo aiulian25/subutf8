@@ -33,12 +33,38 @@ pub enum CollisionPolicy {
     Overwrite,
 }
 
+/// NAME-10: the folder for one day's outputs, such as `2026-09-27`. Built from numbers only, so
+/// it is always one plain folder name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayFolder(String);
+
+impl DayFolder {
+    pub fn new(year: i16, month: i8, day: i8) -> Self {
+        Self(format!("{year:04}-{month:02}-{day:02}"))
+    }
+
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchSettings {
     pub language: Option<SubtitleLanguage>,
     pub destination: Destination,
     pub output_folder: PathBuf,
+    /// NAME-10: outputs in the output folder go into this day's folder.
+    pub day_folder: Option<DayFolder>,
     pub collision_policy: CollisionPolicy,
+}
+
+impl BatchSettings {
+    fn output_folder(&self) -> PathBuf {
+        match &self.day_folder {
+            Some(day) => self.output_folder.join(day.name()),
+            None => self.output_folder.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,12 +162,12 @@ fn destination_parts(
             path,
             relative_folder,
         } => (
-            settings.output_folder.join(relative_folder),
+            settings.output_folder().join(relative_folder),
             file_name(path),
             Placement::OutputFolder,
         ),
         Origin::Dropped { name, .. } => (
-            settings.output_folder.clone(),
+            settings.output_folder(),
             name.clone(),
             Placement::OutputFolder,
         ),
@@ -156,7 +182,7 @@ fn file_name(path: &Path) -> String {
 
 /// SAFE-03: a folder that does not exist yet is checked through its nearest existing parent,
 /// by creating and removing a temporary file exactly as a real write would.
-fn folder_is_writable(folder: &Path) -> bool {
+pub fn folder_is_writable(folder: &Path) -> bool {
     let Some(existing) = folder.ancestors().find(|ancestor| ancestor.is_dir()) else {
         return false;
     };
@@ -298,6 +324,7 @@ mod tests {
             language: None,
             destination: Destination::OutputFolder,
             output_folder: output_folder.to_path_buf(),
+            day_folder: None,
             collision_policy,
         }
     }
@@ -546,5 +573,34 @@ mod tests {
         };
         run(&[nested], &settings(output.path(), CollisionPolicy::Skip));
         assert!(output.path().join("Show/S01/Film.srt").is_file());
+    }
+
+    /// NAME-10: the day's folder holds everything written to the output folder, and nothing
+    /// written beside the originals.
+    #[test]
+    fn outputs_go_into_the_day_folder() {
+        let folder = tempfile::tempdir().unwrap();
+        let original = folder.path().join("Film.srt");
+        fs::write(&original, source("windows-1250-romanian")).unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let mut by_day = settings(output.path(), CollisionPolicy::Skip);
+        by_day.day_folder = Some(DayFolder::new(2026, 9, 7));
+        let nested = ConversionJob {
+            origin: Origin::Disk {
+                path: original.clone(),
+                relative_folder: PathBuf::from("Show"),
+            },
+            encoding: WINDOWS_1250,
+        };
+        let jobs = [
+            nested,
+            dropped_job("Dropped.srt", "windows-1250-romanian", WINDOWS_1250),
+        ];
+        run(&jobs, &by_day);
+        assert!(output.path().join("2026-09-07/Show/Film.srt").is_file());
+        assert!(output.path().join("2026-09-07/Dropped.srt").is_file());
+        by_day.destination = Destination::BesideOriginals;
+        run(&[disk_job(&original, WINDOWS_1250)], &by_day);
+        assert_eq!(output_names(folder.path()), ["Film.srt", "Film1.srt"]);
     }
 }

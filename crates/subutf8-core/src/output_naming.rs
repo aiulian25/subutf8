@@ -44,13 +44,75 @@ pub fn candidate_names<'input>(
     placement: Placement,
 ) -> Result<impl Iterator<Item = String> + 'input, NamingProblem> {
     let (name, extension) = split_srt_name(original).ok_or(NamingProblem::NotAnSrtFile)?;
-    let takes_number = language.is_none() && placement == Placement::BesideOriginal;
+    let (name, is_already_tagged) = without_language_tag(name, language);
+    let takes_number =
+        placement == Placement::BesideOriginal && (language.is_none() || is_already_tagged);
     let plain_number = takes_number.then_some(FIRST_OUTPUT_NUMBER);
     let plain = compose(name, plain_number, language, extension);
     let numbered = (FIRST_OUTPUT_NUMBER..)
         .filter(move |number| Some(*number) != plain_number)
         .map(move |number| compose(name, Some(number), language, extension));
     Ok(iter::once(plain).chain(numbered))
+}
+
+/// NAME-02: a name that already ends with the chosen tag, in any letter case, keeps it once.
+fn without_language_tag<'name>(
+    name: &'name str,
+    language: Option<&SubtitleLanguage>,
+) -> (&'name str, bool) {
+    let tagged = language.and_then(|language| {
+        let (base, tag) = name.rsplit_once(LANGUAGE_TAG_SEPARATOR)?;
+        let is_same_tag = !base.is_empty() && tag.eq_ignore_ascii_case(language.tag());
+        is_same_tag.then_some(base)
+    });
+    match tagged {
+        Some(base) => (base, true),
+        None => (name, false),
+    }
+}
+
+/// SAFE-18: whether `candidate` is a name SubUTF8 gives to an output of `original` beside it
+/// (NAME-02, NAME-03 and NAME-06). Name parts are compared with their letter case (NAME-04).
+pub fn is_output_name(candidate: &str, original: &str) -> bool {
+    let (Some((candidate_name, candidate_extension)), Some((original_name, original_extension))) =
+        (split_srt_name(candidate), split_srt_name(original))
+    else {
+        return false;
+    };
+    if candidate == original || !candidate_extension.eq_ignore_ascii_case(original_extension) {
+        return false;
+    }
+    let is_numbered_or_tagged = candidate_name
+        .strip_prefix(original_name)
+        .is_some_and(|rest| !rest.is_empty() && is_number_then_tag(rest));
+    is_numbered_or_tagged || is_renumbered_tagged_name(candidate_name, original_name)
+}
+
+/// What follows the original's name in an output: a number, a language tag, or both.
+fn is_number_then_tag(rest: &str) -> bool {
+    let tag_start = rest
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let tag = &rest[tag_start..];
+    tag.is_empty()
+        || tag
+            .strip_prefix(LANGUAGE_TAG_SEPARATOR)
+            .is_some_and(|tag| SubtitleLanguage::parse(tag).is_ok())
+}
+
+/// NAME-02: `Film.ro.srt` converted with `ro` gives `Film1.ro.srt`, `Film2.ro.srt` and so on.
+fn is_renumbered_tagged_name(candidate_name: &str, original_name: &str) -> bool {
+    let Some((base, tag)) = original_name.rsplit_once(LANGUAGE_TAG_SEPARATOR) else {
+        return false;
+    };
+    let renumbered = candidate_name
+        .strip_prefix(base)
+        .and_then(|rest| rest.rsplit_once(LANGUAGE_TAG_SEPARATOR));
+    let Some((number, candidate_tag)) = renumbered else {
+        return false;
+    };
+    let is_number = !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit());
+    is_number && candidate_tag.eq_ignore_ascii_case(tag) && SubtitleLanguage::parse(tag).is_ok()
 }
 
 fn compose(
@@ -138,7 +200,25 @@ mod tests {
                 "Film.ro.srt",
                 Some("ro"),
                 Placement::BesideOriginal,
-                "Film.ro.ro.srt",
+                "Film1.ro.srt",
+            ),
+            (
+                "Film.RO.srt",
+                Some("ro"),
+                Placement::BesideOriginal,
+                "Film1.ro.srt",
+            ),
+            (
+                "Film.ro.srt",
+                Some("ro"),
+                Placement::OutputFolder,
+                "Film.ro.srt",
+            ),
+            (
+                "Film.pt-br.srt",
+                Some("pt-BR"),
+                Placement::BesideOriginal,
+                "Film1.pt-BR.srt",
             ),
             (
                 "Film.SRT",
@@ -173,6 +253,44 @@ mod tests {
             names("Film.srt", None, Placement::OutputFolder, 3),
             ["Film.srt", "Film1.srt", "Film2.srt"]
         );
+        assert_eq!(
+            names("Film.ro.srt", Some("ro"), Placement::BesideOriginal, 3),
+            ["Film1.ro.srt", "Film2.ro.srt", "Film3.ro.srt"]
+        );
+    }
+
+    /// SAFE-18.
+    #[test]
+    fn outputs_are_recognised_by_name() {
+        for (candidate, original) in [
+            ("Film1.srt", "Film.srt"),
+            ("Film.ro.srt", "Film.srt"),
+            ("Film12.ro.srt", "Film.srt"),
+            ("Film1.ro.srt", "Film.ro.srt"),
+            ("Film.ro1.srt", "Film.ro.srt"),
+            ("Film.en.ro.srt", "Film.en.srt"),
+            ("Film1.SRT", "Film.srt"),
+        ] {
+            assert!(
+                is_output_name(candidate, original),
+                "{candidate} {original}"
+            );
+        }
+        for (candidate, original) in [
+            ("Film.srt", "Film.srt"),
+            ("Filmx.srt", "Film.srt"),
+            ("Film.ro.srt", "Film1.srt"),
+            ("Film 2.srt", "Film.srt"),
+            ("film1.srt", "Film.srt"),
+            ("Film1.txt", "Film.srt"),
+            ("Film.ro.en.srt", "Film.srt"),
+            ("Film.srt", "Film1.srt"),
+        ] {
+            assert!(
+                !is_output_name(candidate, original),
+                "{candidate} {original}"
+            );
+        }
     }
 
     /// NAME-02 and NAME-03: beside the original, no candidate can take its name.

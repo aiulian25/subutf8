@@ -1,7 +1,10 @@
 mod access;
 mod api;
+mod clock;
 mod constants;
+mod defaults;
 mod folders;
+mod history;
 mod instance;
 mod launcher;
 mod server;
@@ -9,7 +12,9 @@ mod session;
 mod settings;
 #[cfg(test)]
 mod test_support;
+mod update;
 mod views;
+mod watch;
 
 use std::env;
 use std::path::{self, PathBuf};

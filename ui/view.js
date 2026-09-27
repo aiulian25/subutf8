@@ -19,6 +19,8 @@ import {
 
 export const elements = {
   notice: document.getElementById("notice"),
+  searchButton: document.getElementById("search-button"),
+  settingsButton: document.getElementById("settings-button"),
   quitButton: document.getElementById("quit-button"),
   addFilesButton: document.getElementById("add-files-button"),
   addFolderButton: document.getElementById("add-folder-button"),
@@ -35,6 +37,7 @@ export const elements = {
   destinationSelect: document.getElementById("destination-select"),
   outputFolderPath: document.getElementById("output-folder-path"),
   outputFolderButton: document.getElementById("output-folder-button"),
+  byDayCheckbox: document.getElementById("by-day-checkbox"),
   collisionSelect: document.getElementById("collision-select"),
   settingsMessage: document.getElementById("settings-message"),
   progress: document.getElementById("progress"),
@@ -68,7 +71,11 @@ export function problemText(problem) {
     return "";
   }
   const template = REASON_MESSAGES[problem.reason] ?? REASON_MESSAGES[REASONS.internal];
-  return fill(template, { offset: problem.byteOffset, system: problem.systemReason });
+  return fill(template, {
+    offset: problem.byteOffset,
+    system: problem.systemReason,
+    name: problem.relatedName,
+  });
 }
 
 function warningText(warning) {
@@ -79,7 +86,7 @@ function warningText(warning) {
 }
 
 // Long paths are shown by their last parts; the full path is in the tooltip.
-function shortPath(path) {
+export function shortPath(path) {
   const parts = path.split(PATH_SEPARATOR).filter(Boolean);
   if (parts.length <= SHORT_PATH_PARTS) {
     return path;
@@ -93,7 +100,7 @@ function pathLabel(className, path, shown = shortPath(path)) {
   return label;
 }
 
-function fileName(path) {
+export function fileName(path) {
   return path.split(PATH_SEPARATOR).pop();
 }
 
@@ -101,7 +108,7 @@ export function joinPath(folder, name) {
   return folder.endsWith(PATH_SEPARATOR) ? folder + name : folder + PATH_SEPARATOR + name;
 }
 
-function create(tag, className, text) {
+export function create(tag, className, text) {
   const element = document.createElement(tag);
   if (className) {
     element.className = className;
@@ -112,7 +119,7 @@ function create(tag, className, text) {
   return element;
 }
 
-function fillSelect(select, options) {
+export function fillSelect(select, options) {
   select.replaceChildren(
     ...options.map(([value, label]) => {
       const option = create("option", "", label);
@@ -167,7 +174,7 @@ export function renderMode(mode, windowOpen, hasNativePicker) {
   elements.browseButton.hidden = hasNativePicker;
 }
 
-function statusBadge(status) {
+export function statusBadge(status) {
   return create("span", `status status-${status}`, STATUS_LABELS[status] ?? status);
 }
 
@@ -261,11 +268,13 @@ export function renderSettings(settings, isBusy) {
   elements.collisionSelect.value = settings.collisionPolicy;
   elements.outputFolderPath.textContent = shortPath(settings.outputFolder);
   elements.outputFolderPath.title = settings.outputFolder;
+  elements.byDayCheckbox.checked = settings.organiseByDay;
   for (const control of [
     elements.languageInput,
     elements.destinationSelect,
     elements.collisionSelect,
     elements.outputFolderButton,
+    elements.byDayCheckbox,
   ]) {
     control.disabled = isBusy;
   }

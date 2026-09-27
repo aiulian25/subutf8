@@ -19,6 +19,14 @@ export const ROUTES = {
   convert: "/api/convert",
   cancel: "/api/cancel",
   quit: "/api/quit",
+  defaults: "/api/defaults",
+  restoreDefaults: "/api/defaults/restore",
+  history: "/api/history",
+  watchLog: "/api/watch-log",
+  updateCheck: "/api/update/check",
+  updateDownload: "/api/update/download",
+  updateInstall: "/api/update/install",
+  updateRestart: "/api/update/restart",
 };
 
 export const FILE_ACTIONS = {
@@ -43,7 +51,37 @@ export const REASONS = {
   tooMuchDropped: "too-much-dropped",
   listFull: "list-full",
   internal: "internal",
+  dataFolderReadOnly: "data-folder-read-only",
+  noPrivilegeProgram: "no-privilege-program",
+  updateCheckOff: "update-check-off",
 };
+
+export const DESTINATIONS = { besideOriginals: "beside-originals", outputFolder: "output-folder" };
+
+// UI-13: "system" follows the desktop's light or dark setting.
+export const THEMES = { system: "system", light: "light", dark: "dark" };
+export const THEME_OPTIONS = [
+  [THEMES.system, "Match the system"],
+  [THEMES.light, "Light"],
+  [THEMES.dark, "Dark"],
+];
+
+// UPDATE-01 to UPDATE-05; crates/subutf8-app/src/views.rs names the same ones.
+export const PACKAGES = {
+  docker: "docker",
+  deb: "deb",
+  rpm: "rpm",
+  appimage: "appimage",
+  other: "other",
+};
+export const UPDATE_STEPS = {
+  idle: "idle",
+  downloading: "downloading",
+  installing: "installing",
+  installed: "installed",
+  failed: "failed",
+};
+export const PERCENT = 100;
 
 export const STATUSES = {
   ready: "ready",
@@ -112,6 +150,32 @@ export const REASON_MESSAGES = {
   "output-folder-unavailable": "The output folder is not available. Choose another one.",
   "not-available": "Not available here.",
   internal: "Something went wrong. Try again.",
+  "converted-copy": "SubUTF8's converted copy of {name}, so it is left alone.",
+  "waiting-in-list": "Added to the list, where it waits for you to check it.",
+  "settings-damaged":
+    "The saved settings could not be read, so the defaults are shown. Save replaces them.",
+  "settings-unreadable": "The saved settings could not be read: {system}.",
+  "settings-not-saved": "Settings could not be saved: {system}.",
+  "data-folder-read-only": "Settings and the list of converted files cannot be kept.",
+  "history-not-saved": "The list of converted files could not be saved: {system}.",
+  "too-many-watch-folders": "Watch at most 20 folders.",
+  "watch-folder-holds-output-folder":
+    "{name} holds the output folder, so SubUTF8 would convert its own outputs. Choose another folder, or another output folder.",
+  "update-check-off": "Update checks are turned off (SUBUTF8_UPDATE_CHECK=0).",
+  "update-check-failed": "GitHub could not be reached to check for updates.",
+  "no-update": "There is no newer version.",
+  "update-busy": "An update is already under way.",
+  "update-not-downloaded": "Download the update first.",
+  "update-not-installed": "Install the update first.",
+  "no-release-file": "This release has no file for this kind of install. Get it from GitHub.",
+  "download-failed": "The download failed. Try again.",
+  "not-github": "The download led away from GitHub, so it was stopped.",
+  "checksum-mismatch": "The download did not match its checksum, so it was not kept.",
+  "no-checksum": "The release lists no checksum, so the download was not trusted.",
+  "no-privilege-program": "This system has no pkexec to install with.",
+  "not-authorized": "The update was not installed: the password was not given.",
+  "install-failed": "The package manager could not install the update.",
+  "replace-failed": "The AppImage could not be replaced.",
 };
 
 export const WARNING_MESSAGES = {
@@ -174,9 +238,119 @@ export const TEXT = {
   pathEllipsis: "…/",
 };
 
+export const SETTINGS_TEXT = {
+  restored: "The defaults are back.",
+  dockerDataHint: "Mount a folder at /data, as docker-compose.yml shows.",
+  watchExplanation:
+    "New subtitles in these folders are converted with the defaults above, once they have stopped changing. Existing files are never replaced.",
+  watchEmpty: "No folders are watched.",
+  watchInterval: "Looks every {seconds} seconds.",
+  watchUnavailable: "Not available now: {folders}.",
+  watchOutputUnavailable: "The output folder is not available, so watched files wait.",
+  watchNoActivity: "Nothing yet.",
+  removeWatchFolder: "Stop watching {path}",
+  listSeparator: ", ",
+};
+
+export const UPDATE_TEXT = {
+  available: "SubUTF8 {latest} is available. You have {current}.",
+  upToDate: "SubUTF8 {current} is up to date.",
+  notChecked: "You have SubUTF8 {current}.",
+  checkFailed: "GitHub could not be reached. You have SubUTF8 {current}.",
+  checkNow: "Check for updates",
+  download: "Download update",
+  downloading: "Downloading: {percent}%",
+  downloaded: "Downloaded and checked: {path}",
+  install: "Install update",
+  replaceAppImage: "Replace the AppImage",
+  installing: "Installing. Confirm with your password in the system's dialog.",
+  replacing: "Replacing the AppImage.",
+  installed: "The update is installed.",
+  restart: "Restart SubUTF8",
+  docker: "Update the container on the server with:",
+  dockerCommand: "docker compose pull && docker compose up -d",
+  getFromGithub: "Download it from the release page.",
+  releaseNotes: "What's new",
+  installYourselfDeb: "Install it yourself with: sudo apt install {path}",
+  installYourselfRpm: "Install it yourself with: sudo dnf install {path}",
+  banner: "SubUTF8 {latest} is available.",
+  bannerOpen: "Update…",
+  bannerOpenDocker: "How to update",
+  bannerDismiss: "Hide this message",
+  bannerDismissSymbol: "×",
+};
+
+export const SEARCH_TEXT = {
+  settingsGroup: "Settings",
+  filesGroup: "In the list",
+  historyGroup: "Converted before",
+  noResults: "Nothing found.",
+  searching: "Searching…",
+  watched: "watched folder",
+  historyDetail: "{time} · {encoding} · {output}",
+  fileDetail: "{status} · {folder}",
+};
+
+// HIST-02: words the page turns into dates before searching, by how many days ago they are.
+export const DATE_WORDS = { today: 0, yesterday: 1 };
+export const WORD_SEPARATOR = /\s+/;
+export const DATE_PART_LENGTH = 2;
+export const YEAR_LENGTH = 4;
+export const MONTH_OFFSET = 1;
+export const DATE_SEPARATOR = "-";
+// "2026-09-27T14:03:11+03:00" is shown as "2026-09-27 14:03".
+export const SHOWN_TIME_LENGTH = 16;
+export const TIME_SEPARATOR = "T";
+export const SHOWN_TIME_SEPARATOR = " ";
+export const SEARCH_DELAY_MILLISECONDS = 200;
+export const SEARCH_KEY = "k";
+
+// What search finds among the settings: the label shown, extra words that find it, and the
+// control in the Settings dialog it opens. Watch folders are Docker's alone.
+export const SETTING_ENTRIES = [
+  {
+    label: "Subtitle language",
+    words: "language tag ro en detection name",
+    target: "default-language",
+  },
+  {
+    label: "Write to",
+    words: "destination beside originals output folder where",
+    target: "default-destination",
+  },
+  {
+    label: "Output folder",
+    words: "output folder where save",
+    target: "default-output-folder-button",
+  },
+  {
+    label: "A folder for each day",
+    words: "day date daily folder organise organize",
+    target: "default-by-day",
+  },
+  {
+    label: "If the output exists",
+    words: "collision skip rename overwrite exists replace",
+    target: "default-collision",
+  },
+  { label: "Theme", words: "theme light dark appearance colour color", target: "default-theme" },
+  {
+    label: "Watch folders",
+    words: "watch automatic auto convert incoming folder",
+    target: "watch-add-button",
+    containerOnly: true,
+  },
+  {
+    label: "Check for updates",
+    words: "update version upgrade release new",
+    target: "default-update-check",
+  },
+  { label: "Restore defaults", words: "reset restore defaults", target: "settings-restore" },
+];
+
 export const DESTINATION_OPTIONS = [
-  ["beside-originals", "Beside originals"],
-  ["output-folder", "Output folder"],
+  [DESTINATIONS.besideOriginals, "Beside originals"],
+  [DESTINATIONS.outputFolder, "Output folder"],
 ];
 
 export const COLLISION_OPTIONS = [
@@ -239,6 +413,8 @@ export const KEYS = {
   delete: "Delete",
   backspace: "Backspace",
   arrowUp: "ArrowUp",
+  arrowDown: "ArrowDown",
+  escape: "Escape",
   location: "l",
 };
 export const HIDDEN_NAME_PREFIX = ".";

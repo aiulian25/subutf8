@@ -14,12 +14,18 @@ use tokio::sync::watch;
 use tower::ServiceExt;
 
 use crate::access::allowed_hosts;
-use crate::constants::{API_PREFIX, CONTAINER_ADDRESS, CONTAINER_PORT, STATE_ROUTE, TOKEN_HEADER};
+use crate::constants::{
+    API_PREFIX, CONTAINER_ADDRESS, CONTAINER_PORT, DEFAULT_WATCH_INTERVAL, STATE_ROUTE,
+    TOKEN_HEADER,
+};
 use crate::server::{AppState, router};
 use crate::settings::{Mode, Settings};
+use crate::update::Package;
 
 pub const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 pub const LOCAL_HOST: &str = "127.0.0.1:61880";
+/// Hidden, so folder scans and the Browse view leave it out.
+pub const TEST_DATA_FOLDER: &str = ".subutf8-data";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const FIXTURES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -60,17 +66,21 @@ pub fn route(path: &str) -> String {
 }
 
 /// A Docker app whose mounted folders are `root` and `output`, writing dropped files to
-/// `output`. It needs no token.
+/// `output`. It needs no token, and keeps its settings in `output`'s hidden data folder.
 pub fn test_app(root: &Path, output: &Path) -> Router {
-    app_with(None, root, output)
+    router(test_state(root, output))
 }
 
 /// An app that, like the desktop one, requires `TOKEN`.
 pub fn test_app_with_token(root: &Path) -> Router {
-    app_with(Some(String::from(TOKEN)), root, root)
+    router(state_with(Some(String::from(TOKEN)), root, root))
 }
 
-fn app_with(token: Option<String>, root: &Path, output: &Path) -> Router {
+pub fn test_state(root: &Path, output: &Path) -> AppState {
+    state_with(None, root, output)
+}
+
+fn state_with(token: Option<String>, root: &Path, output: &Path) -> AppState {
     let settings = Settings {
         mode: Mode::Container,
         token,
@@ -79,10 +89,14 @@ fn app_with(token: Option<String>, root: &Path, output: &Path) -> Router {
         allowed_area: AllowedArea::new([root.to_path_buf(), output.to_path_buf()]),
         browse_start: root.to_path_buf(),
         default_output_folder: fs::canonicalize(output).unwrap(),
+        has_output_mount: false,
+        data_folder: output.join(TEST_DATA_FOLDER),
+        watch_interval: DEFAULT_WATCH_INTERVAL,
+        update_check_allowed: false,
         files_to_open: Vec::new(),
     };
     let (shutdown, _) = watch::channel(false);
-    router(AppState::new(settings, None, Arc::new(shutdown)))
+    AppState::new(settings, None, Arc::new(shutdown), Package::Docker)
 }
 
 pub async fn send(app: &Router, request: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {

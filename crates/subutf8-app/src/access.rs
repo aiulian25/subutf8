@@ -11,10 +11,15 @@ pub struct NoRandomness;
 pub fn generate_token() -> Result<String, NoRandomness> {
     let mut bytes = [0_u8; TOKEN_BYTES];
     getrandom::fill(&mut bytes).map_err(|_| NoRandomness)?;
-    Ok(bytes.iter().fold(String::new(), |mut text, byte| {
+    Ok(hexadecimal(&bytes))
+}
+
+/// Lower-case hexadecimal, as tokens and SHA-256 checksums are written.
+pub fn hexadecimal(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut text, byte| {
         let _ = write!(text, "{byte:02x}");
         text
-    }))
+    })
 }
 
 /// ACCESS-04: compares in constant time, so the time taken reveals nothing about the token.

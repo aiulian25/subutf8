@@ -105,4 +105,12 @@ export const api = {
   convert: () => request(HTTP_METHODS.post, ROUTES.convert),
   cancel: () => request(HTTP_METHODS.post, ROUTES.cancel),
   quit: () => request(HTTP_METHODS.post, ROUTES.quit),
+  saveDefaults: (defaults) => request(HTTP_METHODS.post, ROUTES.defaults, defaults),
+  restoreDefaults: () => request(HTTP_METHODS.post, ROUTES.restoreDefaults),
+  history: (query) => request(HTTP_METHODS.post, ROUTES.history, { query }),
+  watchLog: () => request(HTTP_METHODS.get, ROUTES.watchLog),
+  checkForUpdate: () => request(HTTP_METHODS.post, ROUTES.updateCheck),
+  downloadUpdate: () => request(HTTP_METHODS.post, ROUTES.updateDownload),
+  installUpdate: () => request(HTTP_METHODS.post, ROUTES.updateInstall),
+  restartAfterUpdate: () => request(HTTP_METHODS.post, ROUTES.updateRestart),
 };

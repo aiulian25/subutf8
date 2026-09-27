@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -9,7 +10,7 @@ use subutf8_core::batch::{
     BatchSettings, CollisionPolicy, ConversionJob, Destination, Origin, run_batch,
 };
 use subutf8_core::classification::{Classification, classify};
-use subutf8_core::constants::{MAXIMUM_FILE_BYTES, MAXIMUM_LISTED_FILES};
+use subutf8_core::constants::{MAXIMUM_FILE_BYTES, MAXIMUM_LISTED_FILES, UTF8_BYTE_ORDER_MARK};
 use subutf8_core::decoding::{ConversionFailure, convert};
 use subutf8_core::detection::{
     Detection, ManualChoiceRefusal, ReviewReason, check_manual_choice, detect, takes_manual_choice,
@@ -18,10 +19,12 @@ use subutf8_core::input_scan::{
     AllowedArea, ListedFile, Scan, SkippedPath, check_chosen_file, scan_folder,
 };
 use subutf8_core::language::SubtitleLanguage;
+use subutf8_core::output_naming::is_output_name;
 use subutf8_core::preview::{PreviewCue, preview};
 use subutf8_core::report::Outcome;
 use subutf8_core::source_file::{ReadError, read_source};
 
+use crate::clock;
 use crate::constants::MAXIMUM_DROPPED_BYTES;
 
 /// Why a file could not even be read when it was added.
@@ -39,6 +42,8 @@ pub struct FileEntry {
     pub origin: Origin,
     pub classification: Result<Classification, ReadProblem>,
     pub detection: Option<Detection>,
+    /// SAFE-18: the name of the file beside it that this one is SubUTF8's output of.
+    pub copy_of: Option<String>,
     pub chosen_encoding: Option<&'static Encoding>,
     pub outcome: Option<Outcome>,
 }
@@ -69,6 +74,8 @@ pub enum FileStatus<'entry> {
     },
     Finished(&'entry Outcome),
     Refused(Refusal),
+    /// SAFE-18: SubUTF8's own output of the named file, left alone.
+    ConvertedCopy(&'entry str),
 }
 
 impl FileEntry {
@@ -80,16 +87,13 @@ impl FileEntry {
     }
 
     /// What converting the file now would do, whatever happened in an earlier run.
-    fn waiting_status(&self) -> FileStatus<'static> {
-        let classification = match self.classification {
-            Ok(classification) => classification,
-            Err(problem) => return FileStatus::Refused(Refusal::Read(problem)),
-        };
-        if let (Some(encoding), true) = (self.chosen_encoding, takes_manual_choice(classification))
-        {
-            return FileStatus::Ready(encoding);
-        }
-        status_of(classification, self.detection)
+    fn waiting_status(&self) -> FileStatus<'_> {
+        waiting_status(
+            self.classification,
+            self.detection,
+            self.copy_of.as_deref(),
+            self.chosen_encoding,
+        )
     }
 
     /// UI-05: a converted file is done; a skipped or failed one is tried again, for example
@@ -119,6 +123,7 @@ impl FileEntry {
         self.origin = prepared.origin;
         self.classification = prepared.classification;
         self.detection = prepared.detection;
+        self.copy_of = prepared.copy_of;
         self.chosen_encoding = None;
         self.outcome = None;
     }
@@ -132,7 +137,7 @@ impl FileEntry {
         match status_of(classification, self.detection) {
             FileStatus::Ready(encoding) => Some(encoding),
             FileStatus::NeedsReview { suggestion, .. } => suggestion,
-            FileStatus::Finished(_) | FileStatus::Refused(_) => None,
+            FileStatus::Finished(_) | FileStatus::Refused(_) | FileStatus::ConvertedCopy(_) => None,
         }
     }
 
@@ -149,6 +154,25 @@ impl FileEntry {
             Origin::Dropped { name, .. } => name.clone(),
         }
     }
+}
+
+fn waiting_status<'entry>(
+    classification: Result<Classification, ReadProblem>,
+    detection: Option<Detection>,
+    copy_of: Option<&'entry str>,
+    chosen_encoding: Option<&'static Encoding>,
+) -> FileStatus<'entry> {
+    let classification = match classification {
+        Ok(classification) => classification,
+        Err(problem) => return FileStatus::Refused(Refusal::Read(problem)),
+    };
+    if let Some(original) = copy_of {
+        return FileStatus::ConvertedCopy(original);
+    }
+    if let (Some(encoding), true) = (chosen_encoding, takes_manual_choice(classification)) {
+        return FileStatus::Ready(encoding);
+    }
+    status_of(classification, detection)
 }
 
 fn status_of(classification: Classification, detection: Option<Detection>) -> FileStatus<'static> {
@@ -197,7 +221,22 @@ pub struct SessionSettings {
     pub language: Option<SubtitleLanguage>,
     pub destination: Destination,
     pub output_folder: PathBuf,
+    /// NAME-10.
+    pub organise_by_day: bool,
     pub collision_policy: CollisionPolicy,
+}
+
+impl SessionSettings {
+    /// NAME-10: the day is the day the conversion starts.
+    pub fn batch_settings(&self, collision_policy: CollisionPolicy) -> BatchSettings {
+        BatchSettings {
+            language: self.language.clone(),
+            destination: self.destination,
+            output_folder: self.output_folder.clone(),
+            day_folder: self.organise_by_day.then(clock::today),
+            collision_policy,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -230,15 +269,23 @@ pub struct ConversionStart {
 }
 
 impl ConversionStart {
-    /// `on_outcome` receives the number of files finished so far and the latest outcome.
-    pub fn run(&self, mut on_outcome: impl FnMut(usize, &Outcome)) {
+    /// `on_outcome` receives the number of files finished so far, and the latest file and
+    /// outcome.
+    pub fn run(&self, mut on_outcome: impl FnMut(usize, &ConversionJob, &Outcome)) {
         run_batch(
             &self.jobs,
             &self.settings,
             &self.listed_paths,
             &self.cancel,
-            |progress, outcome| on_outcome(progress.finished, outcome),
+            |progress, outcome| {
+                let job = &self.jobs[progress.finished - 1];
+                on_outcome(progress.finished, job, outcome);
+            },
         );
+    }
+
+    pub fn language(&self) -> Option<&SubtitleLanguage> {
+        self.settings.language.as_ref()
     }
 }
 
@@ -254,26 +301,90 @@ pub struct Session {
 /// A file read and classified outside the session lock, ready to be listed.
 #[derive(Debug)]
 pub struct PreparedFile {
-    origin: Origin,
+    pub origin: Origin,
     classification: Result<Classification, ReadProblem>,
     detection: Option<Detection>,
+    copy_of: Option<String>,
 }
 
-/// Reads, classifies and detects a file before it is listed (ENC-01 to ENC-10).
+impl PreparedFile {
+    /// What converting the file would do, before it is listed.
+    pub fn status(&self) -> FileStatus<'_> {
+        waiting_status(
+            self.classification,
+            self.detection,
+            self.copy_of.as_deref(),
+            None,
+        )
+    }
+}
+
+/// Reads, classifies and detects a file before it is listed (ENC-01 to ENC-10, SAFE-18).
 pub fn prepare(origin: Origin, language: Option<&SubtitleLanguage>) -> PreparedFile {
     let bytes = origin_bytes(&origin);
     let classification = bytes.as_deref().map(classify).map_err(|problem| *problem);
     let detection = match (&bytes, classification) {
-        (Ok(bytes), Ok(Classification::NeedsDetection | Classification::DamagedOrMixedUtf8)) => {
-            Some(detect(bytes, language))
-        }
+        (Ok(bytes), Ok(classification)) => detection_for(bytes, classification, language),
+        _ => None,
+    };
+    let copy_of = match (&origin, &bytes, classification) {
+        (
+            Origin::Disk { path, .. },
+            Ok(bytes),
+            Ok(Classification::Utf8WithByteOrderMark | Classification::Utf8WithoutByteOrderMark),
+        ) => converted_copy_of(path, bytes, language),
         _ => None,
     };
     PreparedFile {
         origin,
         classification,
         detection,
+        copy_of,
     }
+}
+
+fn detection_for(
+    bytes: &[u8],
+    classification: Classification,
+    language: Option<&SubtitleLanguage>,
+) -> Option<Detection> {
+    let needs_detection = matches!(
+        classification,
+        Classification::NeedsDetection | Classification::DamagedOrMixedUtf8
+    );
+    needs_detection.then(|| detect(bytes, language))
+}
+
+/// SAFE-18: a UTF-8 file is SubUTF8's own output when a `.srt` beside it has a name it would
+/// give that file's output, and converting that file gives exactly this text. Returns the
+/// original's name.
+fn converted_copy_of(
+    path: &Path,
+    bytes: &[u8],
+    language: Option<&SubtitleLanguage>,
+) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let text = std::str::from_utf8(bytes).ok()?;
+    let text = text.strip_prefix(UTF8_BYTE_ORDER_MARK).unwrap_or(text);
+    let folder = path.parent()?;
+    fs::read_dir(folder)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|original| is_output_name(name, original))
+        .find(|original| converts_to(&folder.join(original), text, language))
+}
+
+fn converts_to(original: &Path, text: &str, language: Option<&SubtitleLanguage>) -> bool {
+    let Ok(bytes) = read_source(original) else {
+        return false;
+    };
+    let classification = classify(&bytes);
+    let detection = detection_for(&bytes, classification, language);
+    let FileStatus::Ready(encoding) = status_of(classification, detection) else {
+        return false;
+    };
+    convert(&bytes, encoding).is_ok_and(|conversion| conversion.text == text)
 }
 
 pub fn prepare_listed(file: ListedFile, language: Option<&SubtitleLanguage>) -> PreparedFile {
@@ -432,6 +543,7 @@ impl Session {
                 origin: file.origin,
                 classification: file.classification,
                 detection: file.detection,
+                copy_of: file.copy_of,
                 chosen_encoding: None,
                 outcome: None,
             });
@@ -592,15 +704,9 @@ impl Session {
             file_ids,
             cancel: Arc::clone(&cancel),
         });
-        let settings = BatchSettings {
-            language: self.settings.language.clone(),
-            destination: self.settings.destination,
-            output_folder: self.settings.output_folder.clone(),
-            collision_policy: self.settings.collision_policy,
-        };
         Ok(ConversionStart {
             jobs,
-            settings,
+            settings: self.settings.batch_settings(self.settings.collision_policy),
             listed_paths: self.listed_paths(),
             cancel,
         })
@@ -652,6 +758,7 @@ mod tests {
             language: None,
             destination: Destination::BesideOriginals,
             output_folder: PathBuf::from("/tmp"),
+            organise_by_day: false,
             collision_policy: CollisionPolicy::Skip,
         })
     }
@@ -758,6 +865,43 @@ mod tests {
                 ManualChoiceRefusal::NotApplicable
             ))
         );
+    }
+
+    /// SAFE-18: an output of a file beside it is left alone, and only when its text is exactly
+    /// what converting that file gives; a translation with a tag-like name is converted.
+    #[test]
+    fn outputs_of_files_beside_them_are_left_alone() {
+        let folder = tempfile::tempdir().unwrap();
+        let original = fs::read(Path::new(FIXTURES).join("windows-1250-romanian.srt")).unwrap();
+        let expected =
+            fs::read_to_string(Path::new(FIXTURES).join("../expected/windows-1250-romanian.txt"))
+                .unwrap();
+        let other = fs::read_to_string(Path::new(FIXTURES).join("utf8-romanian.srt")).unwrap();
+        fs::write(folder.path().join("Film.srt"), original).unwrap();
+        for (name, text) in [
+            ("Film1.srt", [UTF8_BYTE_ORDER_MARK, &expected].concat()),
+            ("Film.ro.srt", expected.clone()),
+            ("Film.en.srt", [UTF8_BYTE_ORDER_MARK, &other].concat()),
+        ] {
+            fs::write(folder.path().join(name), text).unwrap();
+        }
+        let area = AllowedArea::new([folder.path().to_path_buf()]);
+        let gathered = gather(&[folder.path().to_path_buf()], false, &area, 100, None);
+        let mut session = session();
+        session.add(gathered.prepared);
+        let statuses: HashMap<String, FileStatus> = session
+            .files
+            .iter()
+            .map(|file| (file.display_name(), file.status()))
+            .collect();
+        assert_eq!(statuses["Film1.srt"], FileStatus::ConvertedCopy("Film.srt"));
+        assert_eq!(
+            statuses["Film.ro.srt"],
+            FileStatus::ConvertedCopy("Film.srt")
+        );
+        assert_eq!(statuses["Film.en.srt"], FileStatus::Ready(UTF_8));
+        assert_eq!(statuses["Film.srt"], FileStatus::Ready(WINDOWS_1250));
+        assert_eq!(session.start_conversion().unwrap().jobs.len(), 2);
     }
 
     /// LIMIT-02.

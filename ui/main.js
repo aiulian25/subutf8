@@ -10,12 +10,17 @@ import {
   NETWORK_FAILURE_STATUS,
   PAYLOAD_TOO_LARGE_STATUS,
   REASONS,
+  SEARCH_KEY,
   SRT_EXTENSION,
   PICKED_CALLBACK,
   TEXT,
   UNAUTHORIZED_STATUS,
+  UPDATE_STEPS,
 } from "./constants.js";
+import { applyTheme, dialogElements, renderUpdateBanner, setUpDialogs } from "./dialogs.js";
+import { openSearch, setUpSearch } from "./search.js";
 import { Selection } from "./selection.js";
+import { isSettingsOpen, openSettings, refreshSettings, setUpSettingsDialog } from "./settings.js";
 import {
   disableControls,
   elements,
@@ -49,12 +54,16 @@ const model = {
   encodingMessage: "",
   pollTimer: null,
   isStopped: false,
-  browse: newBrowse(BROWSE_MODES.files),
+  isBannerDismissed: false,
+  // What to do with the folder the desktop window's picker returns next.
+  pendingFolderPick: null,
+  browse: newBrowse(BROWSE_MODES.files, null),
 };
 
-function newBrowse(mode) {
+function newBrowse(mode, onFolderChosen) {
   return {
     mode,
+    onFolderChosen,
     listing: null,
     folders: new Set(),
     selection: new Selection(),
@@ -72,6 +81,11 @@ function hasNativePicker() {
 
 function isBusy() {
   return model.app?.conversion != null;
+}
+
+// UPDATE-03: a download or an install is followed closely, like a conversion.
+function isUpdating() {
+  return [UPDATE_STEPS.downloading, UPDATE_STEPS.installing].includes(model.app?.update.step);
 }
 
 function fileIds() {
@@ -133,7 +147,7 @@ async function refresh() {
     }
   }
   // ACCESS-09: an open tab checks in regularly; a conversion is followed closely.
-  const delay = isBusy() ? BUSY_POLL_MILLISECONDS : IDLE_POLL_MILLISECONDS;
+  const delay = isBusy() || isUpdating() ? BUSY_POLL_MILLISECONDS : IDLE_POLL_MILLISECONDS;
   model.pollTimer = setTimeout(refresh, delay);
 }
 
@@ -148,9 +162,15 @@ function render() {
   renderSettings(app.settings, isBusy());
   renderMode(app.mode, app.windowOpen, hasNativePicker());
   renderProgress(app.files, app.conversion);
+  renderUpdateBanner(app.update, model.isBannerDismissed);
   if (app.mode === MODES.container && app.roots.length === 0) {
     showNotice(TEXT.noMounts);
   }
+  // UI-13: while Settings is open, it shows the theme being chosen.
+  if (!isSettingsOpen()) {
+    applyTheme(app.defaults.theme);
+  }
+  refreshSettings();
 }
 
 async function refreshPreview() {
@@ -294,6 +314,7 @@ function currentSettings() {
     language: elements.languageInput.value.trim() || null,
     destination: elements.destinationSelect.value,
     outputFolder: settings.outputFolder,
+    organiseByDay: elements.byDayCheckbox.checked,
     collisionPolicy: elements.collisionSelect.value,
   };
 }
@@ -342,6 +363,15 @@ function encodingMessage(targets, refusals) {
     name: first.file.name,
     reason: errorMessage(first.error),
   });
+}
+
+// Search opens a file by selecting it in the list.
+function selectFile(id) {
+  if (!fileIds().includes(id)) {
+    return;
+  }
+  model.selection.selectOnly(id);
+  showSelection();
 }
 
 // The main list: the preview follows the focused file, and Delete removes the selected ones.
@@ -489,8 +519,8 @@ function showListing(listing) {
   showBrowsePath(listing.path);
 }
 
-async function openBrowse(mode, startPath) {
-  model.browse = newBrowse(mode);
+async function openBrowse(mode, startPath, onFolderChosen = null) {
+  model.browse = newBrowse(mode, onFolderChosen);
   renderBrowseDialog();
   elements.browseDialog.showModal();
   await browseTo(startPath);
@@ -511,7 +541,7 @@ async function confirmBrowse() {
   const selected = [...selection.selected];
   if (mode === BROWSE_MODES.folder) {
     elements.browseDialog.close();
-    await saveSettings({ outputFolder: selected.length === 1 ? selected[0] : listing.path });
+    await model.browse.onFolderChosen(selected.length === 1 ? selected[0] : listing.path);
     return;
   }
   if (selected.length === 0) {
@@ -590,11 +620,15 @@ function bindBrowseList() {
 // their places on disk, so they are added like browsed files. Folders bring their sub-folders.
 async function handlePicked(pick, paths) {
   setDragging(false);
+  const onFolderChosen = model.pendingFolderPick;
+  if (pick === NATIVE_PICKS.outputFolder) {
+    model.pendingFolderPick = null;
+  }
   if (paths.length === 0) {
     return;
   }
   if (pick === NATIVE_PICKS.outputFolder) {
-    await saveSettings({ outputFolder: paths[0] });
+    await onFolderChosen?.(paths[0]);
     return;
   }
   await addPaths(paths, pick !== NATIVE_PICKS.files);
@@ -610,12 +644,18 @@ function bindNativePicker() {
   );
 }
 
-function chooseOutputFolder() {
+// One folder, from the system's picker in the desktop window or the Browse view elsewhere.
+function chooseFolder(startPath, onFolderChosen) {
   if (hasNativePicker()) {
+    model.pendingFolderPick = onFolderChosen;
     window.ipc.postMessage(NATIVE_PICKS.outputFolder);
     return;
   }
-  openBrowse(BROWSE_MODES.folder, model.app?.settings.outputFolder);
+  openBrowse(BROWSE_MODES.folder, startPath, onFolderChosen);
+}
+
+function chooseOutputFolder() {
+  chooseFolder(model.app?.settings.outputFolder, (path) => saveSettings({ outputFolder: path }));
 }
 
 function bindBrowseDialog() {
@@ -707,6 +747,39 @@ function bindControls() {
   elements.languageInput.addEventListener("change", () => saveSettings({}));
   elements.destinationSelect.addEventListener("change", () => saveSettings({}));
   elements.collisionSelect.addEventListener("change", () => saveSettings({}));
+  elements.byDayCheckbox.addEventListener("change", () => saveSettings({}));
+}
+
+// The Settings and Search dialogs, and the update banner, which opens Settings at Updates.
+function bindDialogs() {
+  const context = {
+    getApp: () => model.app,
+    refresh,
+    handleFailure,
+    errorMessage,
+    chooseFolder,
+    openSettings,
+    selectFile,
+  };
+  setUpDialogs();
+  setUpSettingsDialog(context);
+  setUpSearch(context);
+  elements.searchButton.addEventListener("click", openSearch);
+  elements.settingsButton.addEventListener("click", () => openSettings());
+  dialogElements.updateBannerOpen.addEventListener("click", () =>
+    openSettings(dialogElements.updateCard.id),
+  );
+  dialogElements.updateBannerDismiss.addEventListener("click", () => {
+    model.isBannerDismissed = true;
+    renderUpdateBanner(model.app.update, true);
+  });
+  document.addEventListener("keydown", (event) => {
+    const wantsSearch = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === SEARCH_KEY;
+    if (wantsSearch && !model.isStopped) {
+      event.preventDefault();
+      openSearch();
+    }
+  });
 }
 
 async function start() {
@@ -720,6 +793,7 @@ async function start() {
   bindBrowseDialog();
   bindDragAndDrop();
   bindControls();
+  bindDialogs();
   try {
     model.encodings = await api.encodings();
   } catch (error) {

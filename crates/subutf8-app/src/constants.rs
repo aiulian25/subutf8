@@ -13,6 +13,95 @@ pub const ALLOWED_HOSTS_SEPARATOR: char = ',';
 pub const DEFAULT_BROWSE_ROOTS: [&str; 2] = ["/mnt", "/media"];
 pub const BROWSE_ROOTS_VARIABLE: &str = "SUBUTF8_BROWSE_ROOTS";
 pub const BROWSE_ROOTS_SEPARATOR: char = ':';
+/// TARGET-04: Docker's persistent output folder, when it is mounted.
+pub const OUTPUT_ROOT: &str = "/output";
+
+/// SET-02: where the saved settings and the history live. Docker keeps them in `/data`, the
+/// desktop in its settings folder; `SUBUTF8_DATA_DIR` moves them on either.
+pub const DATA_FOLDER_VARIABLE: &str = "SUBUTF8_DATA_DIR";
+pub const CONTAINER_DATA_FOLDER: &str = "/data";
+pub const DATA_FOLDER_NAME: &str = "subutf8";
+pub const DEFAULTS_FILE_NAME: &str = "settings.json";
+pub const HISTORY_FILE_NAME: &str = "history.jsonl";
+
+/// HIST-01: the oldest records go once there are more; the file is rewritten only after
+/// `HISTORY_COMPACT_SLACK` more, not after every conversion.
+pub const MAXIMUM_HISTORY_RECORDS: usize = 20_000;
+pub const HISTORY_COMPACT_SLACK: usize = 2_000;
+pub const MAXIMUM_SEARCH_RESULTS: usize = 100;
+pub const MAXIMUM_QUERY_CHARACTERS: usize = 200;
+/// HIST-01: local time, to the second, with the offset from UTC.
+pub const TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%:z";
+
+/// WATCH-01.
+pub const WATCH_INTERVAL_VARIABLE: &str = "SUBUTF8_WATCH_INTERVAL";
+pub const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_secs(60);
+pub const MINIMUM_WATCH_INTERVAL: Duration = Duration::from_secs(2);
+pub const MAXIMUM_WATCH_FOLDERS: usize = 20;
+pub const WATCH_LOG_ENTRIES: usize = 50;
+
+/// UPDATE-01: `SUBUTF8_UPDATE_CHECK=0` turns every update check off.
+pub const UPDATE_CHECK_VARIABLE: &str = "SUBUTF8_UPDATE_CHECK";
+pub const UPDATE_CHECK_OFF: &str = "0";
+pub const LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/aiulian25/subutf8/releases/latest";
+pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const MINIMUM_MANUAL_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+pub const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+pub const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub const USER_AGENT: &str = concat!("subutf8/", env!("CARGO_PKG_VERSION"));
+pub const GITHUB_ACCEPT: &str = "application/vnd.github+json";
+/// UPDATE-03: downloads use HTTPS, and every address, redirects included, is on GitHub.
+pub const HTTPS_SCHEME: &str = "https";
+pub const ALLOWED_DOWNLOAD_DOMAINS: [&str; 2] = ["github.com", "githubusercontent.com"];
+pub const MAXIMUM_REDIRECTS: usize = 5;
+pub const MAXIMUM_RELEASE_BYTES: u64 = 1024 * 1024;
+pub const MAXIMUM_CHECKSUMS_BYTES: u64 = 64 * 1024;
+pub const MAXIMUM_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
+pub const DOWNLOAD_BUFFER_BYTES: usize = 64 * 1024;
+pub const VERSION_TAG_PREFIX: char = 'v';
+pub const VERSION_SEPARATOR: char = '.';
+pub const CHECKSUMS_ASSET: &str = "SHA256SUMS";
+pub const SHA256_DIGEST_PREFIX: &str = "sha256:";
+/// `sha256sum --binary` writes this before the file name.
+pub const CHECKSUM_BINARY_MARK: char = '*';
+pub const EXECUTE_PERMISSION_BITS: u32 = 0o111;
+/// The release files, as `scripts/build-release.sh` names them: a prefix and a suffix each.
+pub const DEB_ASSET: (&str, &str) = ("subutf8_", "_amd64.deb");
+pub const RPM_ASSET: (&str, &str) = ("subutf8-", ".x86_64.rpm");
+pub const APPIMAGE_ASSET: (&str, &str) = ("SubUTF8-", "-x86_64.AppImage");
+/// UPDATE-04: how the running copy was installed, and how it is updated.
+pub const APPIMAGE_VARIABLE: &str = "APPIMAGE";
+pub const INSTALLED_PROGRAM: &str = "/usr/bin/subutf8";
+pub const PATH_VARIABLE: &str = "PATH";
+pub const PRIVILEGE_PROGRAM: &str = "pkexec";
+/// pkexec's answer when the person cancels or cannot authenticate.
+pub const NOT_AUTHORIZED_EXIT_CODES: [i32; 2] = [126, 127];
+pub const DPKG_PROGRAM: &str = "dpkg";
+pub const DPKG_STATUS_FLAG: &str = "-s";
+pub const RPM_PROGRAM: &str = "rpm";
+pub const RPM_QUERY_FLAG: &str = "-q";
+pub const DEB_INSTALL: (&str, &[&str]) = ("apt-get", &["install", "-y"]);
+/// Tried in order; the first one present installs the `.rpm`.
+pub const RPM_INSTALLERS: [(&str, &[&str]); 3] = [
+    ("dnf", &["install", "-y"]),
+    (
+        "zypper",
+        &["--non-interactive", "install", "--allow-unsigned-rpm"],
+    ),
+    ("rpm", &["-U"]),
+];
+pub const PACKAGE_FILE_PERMISSIONS: u32 = 0o644;
+pub const EXECUTABLE_PERMISSIONS: u32 = 0o755;
+pub const PARTIAL_DOWNLOAD_PREFIX: &str = ".subutf8-";
+pub const PARTIAL_DOWNLOAD_SUFFIX: &str = ".part";
+pub const REPLACEMENT_SUFFIX: &str = ".new";
+
+/// UI-13: `ui/index.html` names the theme with this attribute; the server fills in the saved
+/// one, so the page never flashes the wrong colours.
+pub const THEME_PLACEHOLDER: &str = "data-theme=\"system\"";
+pub const THEME_ATTRIBUTE: &str = "data-theme";
 
 /// ACCESS-01.
 pub const CONTAINER_PORT: u16 = 61880;
@@ -99,6 +188,14 @@ pub const SETTINGS_ROUTE: &str = "/settings";
 pub const CONVERT_ROUTE: &str = "/convert";
 pub const CANCEL_ROUTE: &str = "/cancel";
 pub const QUIT_ROUTE: &str = "/quit";
+pub const DEFAULTS_ROUTE: &str = "/defaults";
+pub const RESTORE_DEFAULTS_ROUTE: &str = "/defaults/restore";
+pub const HISTORY_ROUTE: &str = "/history";
+pub const WATCH_LOG_ROUTE: &str = "/watch-log";
+pub const UPDATE_CHECK_ROUTE: &str = "/update/check";
+pub const UPDATE_DOWNLOAD_ROUTE: &str = "/update/download";
+pub const UPDATE_INSTALL_ROUTE: &str = "/update/install";
+pub const UPDATE_RESTART_ROUTE: &str = "/update/restart";
 
 /// ACCESS-03: the interface reads the token from this part of its address.
 pub const TOKEN_FRAGMENT: &str = "#token=";
@@ -109,10 +206,13 @@ pub const CSS_CONTENT_TYPE: &str = "text/css; charset=utf-8";
 pub const JAVASCRIPT_CONTENT_TYPE: &str = "text/javascript; charset=utf-8";
 pub const SVG_CONTENT_TYPE: &str = "image/svg+xml";
 
+/// The page itself; the other interface files are loaded from it.
+pub const INDEX_PATH: &str = "/";
+
 /// The interface files, built into the program so every build serves the same ones.
-pub const ASSETS: [(&str, &str, &[u8]); 8] = [
+pub const ASSETS: [(&str, &str, &[u8]); 11] = [
     (
-        "/",
+        INDEX_PATH,
         HTML_CONTENT_TYPE,
         include_bytes!("../../../ui/index.html"),
     ),
@@ -147,6 +247,21 @@ pub const ASSETS: [(&str, &str, &[u8]); 8] = [
         include_bytes!("../../../ui/main.js"),
     ),
     (
+        "/settings.js",
+        JAVASCRIPT_CONTENT_TYPE,
+        include_bytes!("../../../ui/settings.js"),
+    ),
+    (
+        "/search.js",
+        JAVASCRIPT_CONTENT_TYPE,
+        include_bytes!("../../../ui/search.js"),
+    ),
+    (
+        "/dialogs.js",
+        JAVASCRIPT_CONTENT_TYPE,
+        include_bytes!("../../../ui/dialogs.js"),
+    ),
+    (
         "/icon.svg",
         SVG_CONTENT_TYPE,
         include_bytes!("../../../packaging/icon/subutf8.svg"),
@@ -161,6 +276,11 @@ pub const CONTAINER_RUNNING_MESSAGE: &str = "SubUTF8 is running. Open http://loc
 pub const CONTAINER_FOLDERS_MESSAGE: &str = "Folders it can browse:";
 pub const NO_FOLDERS_MESSAGE: &str = "No folders are mounted. Mount your subtitle folders under \
     /media or /mnt, as docker-compose.yml shows, and start the container again.";
+pub const DATA_FOLDER_READ_ONLY_MESSAGE: &str = "Settings and the list of converted files \
+    cannot be saved. Mount a folder at /data, as docker-compose.yml shows.";
+pub const OUTPUT_FOLDER_READ_ONLY_MESSAGE: &str = "The folder mounted at /output cannot be \
+    written to. Give it to the user and group in PUID and PGID, for example with \
+    sudo chown 1000:1000 on the server's folder.";
 pub const START_FAILED_MESSAGE: &str = "SubUTF8 could not start:";
 pub const NO_RANDOMNESS_MESSAGE: &str =
     "The system could not supply random numbers for the access token.";

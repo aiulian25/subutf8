@@ -8,7 +8,7 @@ use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use subutf8_core::batch::{CollisionPolicy, Destination};
+use subutf8_core::batch::folder_is_writable;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
@@ -18,22 +18,35 @@ use crate::api;
 use crate::constants::{
     ADD_ROUTE, API_PREFIX, ASSETS, BROWSE_ROUTE, CANCEL_ROUTE, CLEAR_ROUTE,
     CONTAINER_FOLDERS_MESSAGE, CONTAINER_RUNNING_MESSAGE, CONTENT_SECURITY_POLICY, CONVERT_ROUTE,
-    DENY_FRAMING, ENCODING_ROUTE, ENCODINGS_ROUTE, IDLE_CHECK_INTERVAL, IDLE_LIMIT, LOOPBACK_HOST,
+    DATA_FOLDER_READ_ONLY_MESSAGE, DEFAULTS_ROUTE, DENY_FRAMING, ENCODING_ROUTE, ENCODINGS_ROUTE,
+    HISTORY_ROUTE, IDLE_CHECK_INTERVAL, IDLE_LIMIT, INDEX_PATH, LOOPBACK_HOST,
     MAXIMUM_UPLOAD_BYTES, NO_FOLDERS_MESSAGE, NO_REFERRER, NO_SNIFF, NO_STORE, OPEN_ROUTE,
-    PREVIEW_ROUTE, QUIT_ROUTE, REMOVE_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_FRAGMENT,
-    TOKEN_HEADER, UPLOAD_ROUTE,
+    OUTPUT_FOLDER_READ_ONLY_MESSAGE, PREVIEW_ROUTE, QUIT_ROUTE, REMOVE_ROUTE,
+    RESTORE_DEFAULTS_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, THEME_ATTRIBUTE, THEME_PLACEHOLDER,
+    TOKEN_FRAGMENT, TOKEN_HEADER, UPDATE_CHECK_INTERVAL, UPDATE_CHECK_ROUTE, UPDATE_DOWNLOAD_ROUTE,
+    UPDATE_INSTALL_ROUTE, UPDATE_RESTART_ROUTE, UPLOAD_ROUTE, WATCH_LOG_ROUTE,
 };
+use crate::defaults::{Defaults, DefaultsStore};
+use crate::history::History;
 use crate::instance;
 use crate::launcher::Interface;
-use crate::session::{Session, SessionSettings};
+use crate::session::Session;
 use crate::settings::{Mode, Settings};
+use crate::update::{Package, UpdateState, detect_package};
+use crate::watch::{WatchLog, watch_loop};
 
-/// Shared by every request. The session lock is held only for quick changes; reading files,
-/// detection and conversion run outside it.
+/// Shared by every request. Each lock is held only for quick changes, and never while
+/// another is taken; reading files, detection, conversion and downloads run outside them.
 #[derive(Clone)]
 pub struct AppState {
     pub settings: Arc<Settings>,
     pub session: Arc<Mutex<Session>>,
+    pub defaults: Arc<Mutex<DefaultsStore>>,
+    pub history: Arc<Mutex<History>>,
+    pub watch_log: Arc<Mutex<WatchLog>>,
+    pub update: Arc<Mutex<UpdateState>>,
+    /// SET-02: settings and the history can be kept.
+    pub data_folder_writable: bool,
     pub interface: Option<Arc<Interface>>,
     pub shutdown: Arc<watch::Sender<bool>>,
     last_activity: Arc<Mutex<Instant>>,
@@ -46,20 +59,24 @@ pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl AppState {
+    /// SET-02: reads the saved defaults and the history; the session starts from the defaults.
     pub fn new(
         settings: Settings,
         interface: Option<Arc<Interface>>,
         shutdown: Arc<watch::Sender<bool>>,
+        package: Package,
     ) -> Self {
-        let session = Session::new(SessionSettings {
-            language: None,
-            destination: Destination::BesideOriginals,
-            output_folder: settings.default_output_folder.clone(),
-            collision_policy: CollisionPolicy::Skip,
-        });
+        let defaults = DefaultsStore::load(&settings.data_folder, Defaults::factory(&settings));
+        let history = History::load(&settings.data_folder);
+        let session = Session::new(defaults.current.session_settings());
         Self {
+            data_folder_writable: folder_is_writable(&settings.data_folder),
             settings: Arc::new(settings),
             session: Arc::new(Mutex::new(session)),
+            defaults: Arc::new(Mutex::new(defaults)),
+            history: Arc::new(Mutex::new(history)),
+            watch_log: Arc::new(Mutex::new(WatchLog::default())),
+            update: Arc::new(Mutex::new(UpdateState::new(package))),
             interface,
             shutdown,
             last_activity: Arc::new(Mutex::new(Instant::now())),
@@ -68,6 +85,22 @@ impl AppState {
 
     pub fn session(&self) -> MutexGuard<'_, Session> {
         lock(&self.session)
+    }
+
+    pub fn defaults(&self) -> MutexGuard<'_, DefaultsStore> {
+        lock(&self.defaults)
+    }
+
+    pub fn history(&self) -> MutexGuard<'_, History> {
+        lock(&self.history)
+    }
+
+    pub fn watch_log(&self) -> MutexGuard<'_, WatchLog> {
+        lock(&self.watch_log)
+    }
+
+    pub fn update(&self) -> MutexGuard<'_, UpdateState> {
+        lock(&self.update)
     }
 
     fn record_activity(&self) {
@@ -98,6 +131,14 @@ pub fn router(state: AppState) -> Router {
         .route(CONVERT_ROUTE, post(api::convert))
         .route(CANCEL_ROUTE, post(api::cancel))
         .route(QUIT_ROUTE, post(api::quit))
+        .route(DEFAULTS_ROUTE, post(api::save_defaults))
+        .route(RESTORE_DEFAULTS_ROUTE, post(api::restore_defaults))
+        .route(HISTORY_ROUTE, post(api::history))
+        .route(WATCH_LOG_ROUTE, get(api::watch_log))
+        .route(UPDATE_CHECK_ROUTE, post(api::check_for_update))
+        .route(UPDATE_DOWNLOAD_ROUTE, post(api::download_update))
+        .route(UPDATE_INSTALL_ROUTE, post(api::install_update))
+        .route(UPDATE_RESTART_ROUTE, post(api::restart_after_update))
         .route_layer(middleware::from_fn_with_state(state.clone(), check_access));
     Router::new()
         .nest(API_PREFIX, api)
@@ -158,17 +199,29 @@ async fn check_access(State(state): State<AppState>, request: Request, next: Nex
     next.run(request).await
 }
 
-/// The interface files hold no user data, so they need no token (ACCESS-04).
-async fn serve_asset(uri: Uri) -> Response {
-    let Some((_, content_type, body)) = ASSETS.iter().find(|(path, ..)| *path == uri.path()) else {
+/// The interface files hold no user data, so they need no token (ACCESS-04). The page comes
+/// with the saved theme already set (UI-13).
+async fn serve_asset(State(app): State<AppState>, uri: Uri) -> Response {
+    let Some((path, content_type, body)) = ASSETS.iter().find(|(path, ..)| *path == uri.path())
+    else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    ([(header::CONTENT_TYPE, *content_type)], *body).into_response()
+    if *path != INDEX_PATH {
+        return ([(header::CONTENT_TYPE, *content_type)], *body).into_response();
+    }
+    let theme = app.defaults().current.theme.attribute_value();
+    let page = String::from_utf8_lossy(body).replacen(
+        THEME_PLACEHOLDER,
+        &format!("{THEME_ATTRIBUTE}=\"{theme}\""),
+        1,
+    );
+    ([(header::CONTENT_TYPE, *content_type)], page).into_response()
 }
 
-pub async fn run(settings: Settings) -> io::Result<()> {
+pub async fn run(mut settings: Settings) -> io::Result<()> {
     let listener = TcpListener::bind(settings.listen_address).await?;
     let port = listener.local_addr()?.port();
+    settings.listen_address.set_port(port);
     let (shutdown, _) = watch::channel(false);
     let shutdown = Arc::new(shutdown);
     let interface = settings.token.as_ref().map(|token| {
@@ -176,7 +229,11 @@ pub async fn run(settings: Settings) -> io::Result<()> {
         Interface::new(address, Arc::clone(&shutdown))
     });
     let files_to_open = settings.files_to_open.clone();
-    let state = AppState::new(settings, interface.clone(), Arc::clone(&shutdown));
+    let mode = settings.mode;
+    let package = tokio::task::spawn_blocking(move || detect_package(mode))
+        .await
+        .unwrap_or(Package::Other);
+    let state = AppState::new(settings, interface.clone(), Arc::clone(&shutdown), package);
     if !files_to_open.is_empty() {
         let _ = api::add_paths(&state, files_to_open, false).await;
     }
@@ -186,7 +243,13 @@ pub async fn run(settings: Settings) -> io::Result<()> {
             tokio::spawn(stop_when_idle(state.clone()));
             interface.show();
         }
-        _ => print_start_up(&state.settings),
+        _ => {
+            print_start_up(&state);
+            tokio::spawn(watch_loop(state.clone()));
+        }
+    }
+    if state.settings.update_check_allowed {
+        tokio::spawn(check_for_updates_daily(state.clone()));
     }
     let served = axum::serve(listener, router(state.clone()))
         .with_graceful_shutdown(wait_for_shutdown(shutdown.subscribe()))
@@ -198,9 +261,14 @@ pub async fn run(settings: Settings) -> io::Result<()> {
     served
 }
 
-/// ACCESS-07 and TARGET-02: Docker says where to open it and which folders it can use.
-fn print_start_up(settings: &Settings) {
+/// ACCESS-07, TARGET-02, TARGET-04 and SET-02: Docker says where to open it, which folders
+/// it can use, and which mounted folders it cannot write to.
+fn print_start_up(state: &AppState) {
+    let settings = &state.settings;
     println!("{CONTAINER_RUNNING_MESSAGE}");
+    if !state.data_folder_writable {
+        println!("{DATA_FOLDER_READ_ONLY_MESSAGE}");
+    }
     let roots = settings.allowed_area.roots();
     if roots.is_empty() {
         println!("{NO_FOLDERS_MESSAGE}");
@@ -209,6 +277,20 @@ fn print_start_up(settings: &Settings) {
     println!("{CONTAINER_FOLDERS_MESSAGE}");
     for root in roots {
         println!("  {}", root.display());
+    }
+    if settings.has_output_mount && !folder_is_writable(&settings.default_output_folder) {
+        println!("{OUTPUT_FOLDER_READ_ONLY_MESSAGE}");
+    }
+}
+
+/// UPDATE-01: at start and once a day, unless turned off in Settings.
+async fn check_for_updates_daily(state: AppState) {
+    let mut interval = tokio::time::interval(UPDATE_CHECK_INTERVAL);
+    loop {
+        interval.tick().await;
+        if state.defaults().current.update_check {
+            api::run_update_check(&state).await;
+        }
     }
 }
 

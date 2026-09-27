@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="system">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -15,10 +15,27 @@
         <h1>SubUTF8</h1>
         <p>Convert subtitle text to UTF-8 safely</p>
       </div>
+      <button
+        type="button"
+        id="search-button"
+        class="quiet-button header-button"
+        title="Search (Ctrl+K)"
+        aria-keyshortcuts="Control+K"
+      >
+        <span class="icon icon-search" aria-hidden="true"></span>Search
+      </button>
+      <button type="button" id="settings-button" class="quiet-button header-button">
+        <span class="icon icon-settings" aria-hidden="true"></span>Settings
+      </button>
       <button type="button" id="quit-button" class="quiet-button" hidden>Quit</button>
     </header>
 
     <p id="notice" class="notice" role="alert" hidden></p>
+    <div id="update-banner" class="update-banner" role="status" hidden>
+      <span id="update-banner-text"></span>
+      <button type="button" id="update-banner-open" class="primary-button"></button>
+      <button type="button" id="update-banner-dismiss" class="quiet-button"></button>
+    </div>
 
     <main class="workspace">
       <section class="files-pane" aria-labelledby="files-heading">
@@ -90,6 +107,10 @@
             <span id="output-folder-path" class="path"></span>
             <button type="button" id="output-folder-button" class="quiet-button">Change…</button>
           </span>
+          <label class="checkbox-label">
+            <input type="checkbox" id="by-day-checkbox" />
+            A folder for each day
+          </label>
         </div>
         <label class="setting">
           <span>If the output exists</span>
@@ -170,6 +191,113 @@
           <button type="button" id="browse-confirm" class="primary-button"></button>
         </span>
       </div>
+    </dialog>
+
+    <dialog
+      id="settings-dialog"
+      class="app-dialog settings-dialog"
+      aria-labelledby="settings-title"
+    >
+      <div class="dialog-heading">
+        <h2 id="settings-title">Settings</h2>
+        <p class="muted">
+          SubUTF8 starts with these each time. The bar at the bottom changes only what you are
+          converting now.
+        </p>
+      </div>
+      <p id="settings-notice" class="dialog-notice" role="alert" hidden></p>
+      <div class="settings-body">
+        <section class="settings-section" aria-labelledby="settings-conversion-heading">
+          <h3 id="settings-conversion-heading">Conversion</h3>
+          <label class="setting">
+            <span>Subtitle language</span>
+            <input
+              id="default-language"
+              list="language-list"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="none"
+              size="6"
+            />
+          </label>
+          <label class="setting">
+            <span>Write to</span>
+            <select id="default-destination"></select>
+          </label>
+          <div class="setting">
+            <span>Output folder</span>
+            <span class="output-folder-row">
+              <span id="default-output-folder" class="path"></span>
+              <button type="button" id="default-output-folder-button" class="quiet-button">
+                Change…
+              </button>
+            </span>
+          </div>
+          <label class="checkbox-label">
+            <input type="checkbox" id="default-by-day" />
+            Put outputs in a folder for each day, such as 2026-09-27
+          </label>
+          <label class="setting">
+            <span>If the output exists</span>
+            <select id="default-collision"></select>
+          </label>
+        </section>
+        <section class="settings-section" aria-labelledby="settings-appearance-heading">
+          <h3 id="settings-appearance-heading">Appearance</h3>
+          <label class="setting">
+            <span>Theme</span>
+            <select id="default-theme"></select>
+          </label>
+        </section>
+        <section
+          id="watch-section"
+          class="settings-section"
+          aria-labelledby="settings-watch-heading"
+          hidden
+        >
+          <h3 id="settings-watch-heading">Watch folders</h3>
+          <p id="watch-explanation" class="muted"></p>
+          <ul id="watch-folders" class="plain-list watch-folders"></ul>
+          <button type="button" id="watch-add-button">Add folder…</button>
+          <h4>Recent activity</h4>
+          <p id="watch-status" class="muted"></p>
+          <ul id="watch-log" class="plain-list watch-log"></ul>
+        </section>
+        <section class="settings-section" aria-labelledby="settings-updates-heading">
+          <h3 id="settings-updates-heading">Updates</h3>
+          <div id="update-card" class="update-card" tabindex="-1" aria-live="polite"></div>
+          <label class="checkbox-label">
+            <input type="checkbox" id="default-update-check" />
+            Check for updates once a day
+          </label>
+        </section>
+      </div>
+      <p id="settings-dialog-message" class="dialog-message" role="alert" hidden></p>
+      <div class="dialog-footer">
+        <button type="button" id="settings-restore" class="quiet-button">Restore defaults</button>
+        <span class="dialog-buttons">
+          <button type="button" id="settings-cancel">Cancel</button>
+          <button type="button" id="settings-save" class="primary-button">Save</button>
+        </span>
+      </div>
+    </dialog>
+
+    <dialog id="search-dialog" class="app-dialog search-dialog" aria-label="Search">
+      <input
+        id="search-input"
+        class="search-input"
+        type="search"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="Search settings, files and converted files"
+        aria-label="Search"
+        aria-controls="search-results"
+      />
+      <p class="keyboard-hint">
+        A name, folder, encoding, language or date, such as 2026-09-27, today or yesterday · ↓ ↑
+        move · Enter opens · Esc closes
+      </p>
+      <div id="search-results" class="search-results" aria-live="polite"></div>
     </dialog>
   </body>
 </html>
