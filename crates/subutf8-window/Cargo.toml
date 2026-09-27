@@ -1,0 +1,18 @@
+[package]
+name = "subutf8-window"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Built for glibc in packaging/build/Dockerfile.window, since it links WebKitGTK; the
+# workspace's default members leave it out of the static musl build.
+[dependencies]
+# The GTK version tao and wry use, for the program name that desktops match to subutf8.desktop.
+gtk = "0.18.2"
+serde_json = "1.0.151"
+tao = "0.37.1"
+wry = { version = "0.57.0", default-features = false, features = ["os-webview"] }
+
+[lints]
+workspace = true

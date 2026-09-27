@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SubUTF8</title>
+    <link rel="icon" href="icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="styles.css" />
+    <script type="module" src="main.js"></script>
+  </head>
+  <body>
+    <header class="app-header">
+      <img src="icon.svg" alt="" class="app-icon" width="40" height="40" />
+      <div class="app-title">
+        <h1>SubUTF8</h1>
+        <p>Convert subtitle text to UTF-8 safely</p>
+      </div>
+      <button type="button" id="quit-button" class="quiet-button" hidden>Quit</button>
+    </header>
+
+    <p id="notice" class="notice" role="alert" hidden></p>
+
+    <main class="workspace">
+      <section class="files-pane" aria-labelledby="files-heading">
+        <div id="drop-zone" class="drop-zone">
+          <p class="drop-title">Drop .srt files or folders here</p>
+          <p id="drop-hint" class="drop-hint"></p>
+          <span class="drop-buttons">
+            <button type="button" id="add-files-button" class="primary-button" hidden>
+              Add files…
+            </button>
+            <button type="button" id="add-folder-button" hidden>Add folder…</button>
+            <button type="button" id="browse-button" class="primary-button">Browse…</button>
+          </span>
+        </div>
+
+        <div class="list-header">
+          <h2 id="files-heading">Files</h2>
+          <p class="keyboard-hint">
+            Click, Ctrl+click or Shift+click to select · Ctrl+A selects all · Delete removes
+          </p>
+          <button type="button" id="clear-button" class="quiet-button">Clear list</button>
+        </div>
+        <p id="list-message" class="list-message" aria-live="polite" hidden></p>
+
+        <div class="table-scroll">
+          <table class="file-table" aria-labelledby="files-heading" aria-multiselectable="true">
+            <thead>
+              <tr>
+                <th scope="col">Name</th>
+                <th scope="col">Encoding</th>
+                <th scope="col">Status</th>
+                <th scope="col">Output</th>
+                <th scope="col"><span class="visually-hidden">Remove</span></th>
+              </tr>
+            </thead>
+            <tbody id="file-rows"></tbody>
+          </table>
+          <p id="empty-list" class="empty-list">No files yet.</p>
+        </div>
+      </section>
+
+      <aside class="preview-pane" aria-labelledby="preview-heading">
+        <h2 id="preview-heading">Preview</h2>
+        <div id="preview-body" class="preview-body" aria-live="polite"></div>
+      </aside>
+    </main>
+
+    <footer class="bottom-bar">
+      <div class="settings">
+        <label class="setting">
+          <span>Subtitle language</span>
+          <input
+            id="language-input"
+            list="language-list"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="none"
+            size="6"
+          />
+        </label>
+        <datalist id="language-list"></datalist>
+        <label class="setting">
+          <span>Write to</span>
+          <select id="destination-select"></select>
+        </label>
+        <div class="setting output-folder">
+          <span>Output folder</span>
+          <span class="output-folder-row">
+            <span id="output-folder-path" class="path"></span>
+            <button type="button" id="output-folder-button" class="quiet-button">Change…</button>
+          </span>
+        </div>
+        <label class="setting">
+          <span>If the output exists</span>
+          <select id="collision-select"></select>
+        </label>
+        <p id="settings-message" class="settings-message" role="alert" hidden></p>
+      </div>
+      <div class="actions">
+        <div class="progress-area">
+          <progress id="progress" max="1" value="0" hidden></progress>
+          <p id="summary" class="summary" aria-live="polite"></p>
+        </div>
+        <button type="button" id="cancel-button" hidden>Cancel</button>
+        <button type="button" id="convert-button" class="primary-button">Convert to UTF-8</button>
+      </div>
+    </footer>
+
+    <dialog id="browse-dialog" class="browse-dialog" aria-labelledby="browse-title">
+      <h2 id="browse-title"></h2>
+      <div class="browse-location">
+        <button
+          type="button"
+          id="browse-up"
+          class="quiet-button"
+          aria-label="Up one folder"
+          title="Up one folder (Backspace or Alt+Up)"
+        >
+          ↑ Up
+        </button>
+        <input
+          id="browse-path"
+          class="path browse-path"
+          spellcheck="false"
+          autocomplete="off"
+          aria-label="Folder, press Enter to open"
+          title="Type a folder and press Enter (Ctrl+L)"
+        />
+      </div>
+      <nav id="browse-crumbs" class="browse-crumbs" aria-label="Folder path"></nav>
+      <div class="browse-toolbar">
+        <div id="browse-shortcuts" class="browse-shortcuts"></div>
+        <input
+          id="browse-filter"
+          class="browse-filter"
+          type="search"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="Filter this folder…"
+          aria-label="Filter this folder"
+        />
+      </div>
+      <ul
+        id="browse-entries"
+        class="browse-entries"
+        role="listbox"
+        aria-multiselectable="true"
+        aria-labelledby="browse-title"
+      ></ul>
+      <p id="browse-message" class="browse-message" role="status"></p>
+      <p class="browse-tray">
+        <span id="browse-tray-text"></span>
+        <button type="button" id="browse-clear-selection" class="quiet-button" hidden>
+          Clear selection
+        </button>
+      </p>
+      <p class="keyboard-hint">
+        Click, Ctrl+click or Shift+click to select · Ctrl+A selects all shown · Double-click or
+        Enter opens a folder · Backspace goes up · Ctrl+L types a folder
+      </p>
+      <div class="browse-footer">
+        <label id="subfolders-label" class="checkbox-label">
+          <input type="checkbox" id="subfolders-checkbox" />
+          Include sub-folders
+        </label>
+        <span class="browse-buttons">
+          <button type="button" id="browse-cancel">Cancel</button>
+          <button type="button" id="browse-add-folder">Add this folder</button>
+          <button type="button" id="browse-confirm" class="primary-button"></button>
+        </span>
+      </div>
+    </dialog>
+  </body>
+</html>

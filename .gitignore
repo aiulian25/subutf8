@@ -1,0 +1,24 @@
+# Only what the container needs to build and run is published; everything else stays local.
+/*
+!/.dockerignore
+!/.env.example
+!/.gitignore
+!/Cargo.lock
+!/Cargo.toml
+!/LICENSE
+!/README.md
+!/crates/
+!/docker-compose.yml
+!/docs/
+!/packaging/
+!/rust-toolchain.toml
+!/ui/
+/crates/*/tests/
+/docs/*
+!/docs/screenshots/
+/packaging/*
+!/packaging/collect-licenses.sh
+!/packaging/docker/
+!/packaging/icon/
+.env
+*.log

@@ -1,0 +1,19 @@
+[workspace]
+members = ["crates/*"]
+# The window links WebKitGTK and is built separately for glibc (Dockerfile.window).
+default-members = ["crates/subutf8-core", "crates/subutf8-app"]
+resolver = "3"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
